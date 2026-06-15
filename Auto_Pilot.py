@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QCheckBox, QPlainTextEdit, QLabel, QDialog, QSpinBox,
     QDoubleSpinBox, QFormLayout, QLineEdit, QDialogButtonBox, QGroupBox,
-    QSystemTrayIcon, QMenu, QMessageBox, QScrollArea, QFrame, QSizePolicy,
+    QMessageBox, QScrollArea, QFrame, QSizePolicy,
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer, QObject
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QBrush
@@ -1346,8 +1346,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} v{VERSION}")
         self.setWindowIcon(app_icon())
         self.resize(880, 680)
-        self.tray        = None
-        self._force_quit = False
         self._tg_poller: TelegramPollerThread | None = None
         self._step_items: list[StepItemWidget] = []
         self._screen_busy = False   # /screen 중복 캡처 방지 플래그
@@ -1513,7 +1511,6 @@ class MainWindow(QMainWindow):
         self.worker.step_progress_signal.connect(self._on_step_progress)
         self.worker.auto_paused_signal.connect(self._on_auto_paused)
         self.setup_logging()
-        self.setup_tray()
 
         # 기본 스텝 삽입 — lbl_progress 등 모든 위젯 생성 후 여기서 실행
         for default_text in DEFAULT_STEPS:
@@ -1523,33 +1520,6 @@ class MainWindow(QMainWindow):
         self.move(screen_geom.right() - self.width() - 10,
                   screen_geom.bottom() - self.height() - 50)
 
-    # ── 트레이 ────────────────────────────────────────────
-    def setup_tray(self):
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            return
-        self.tray = QSystemTrayIcon(app_icon(), self)
-        self.tray.setToolTip(APP_NAME)
-        menu = QMenu()
-        menu.addAction("창 보이기").triggered.connect(self.show_normal_from_tray)
-        menu.addAction("창 숨기기").triggered.connect(self.hide)
-        menu.addSeparator()
-        menu.addAction("종료").triggered.connect(self.quit_from_tray)
-        self.tray.setContextMenu(menu)
-        self.tray.activated.connect(self.on_tray_activated)
-        self.tray.show()
-
-    def on_tray_activated(self, reason):
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self.show_normal_from_tray()
-
-    def show_normal_from_tray(self):
-        self.showNormal()
-        self.activateWindow()
-        self.raise_()
-
-    def quit_from_tray(self):
-        self._force_quit = True
-        self.close()
 
     # ── 스텝 관리 ─────────────────────────────────────────
     def add_step(self, _checked=False, text: str = ""):
@@ -1604,11 +1574,6 @@ class MainWindow(QMainWindow):
     def _on_auto_paused(self, reason: str):
         logging.warning(f"⚠️ 자동 일시 정지: {reason}")
         self.btn_force_next.setEnabled(True)
-        if self.tray:
-            self.tray.showMessage(
-                APP_NAME, f"자동 정지: {reason}",
-                QSystemTrayIcon.MessageIcon.Warning, 5000,
-            )
 
     def _on_force_next(self):
         self.worker.force_next_step()
@@ -1915,13 +1880,6 @@ class MainWindow(QMainWindow):
         self.toast.show()
 
     def closeEvent(self, event):
-        if getattr(self, "tray", None) and not getattr(self, "_force_quit", False):
-            event.ignore()
-            self.hide()
-            self.tray.showMessage(APP_NAME,
-                "백그라운드에서 계속 실행 중입니다. 트레이 아이콘에서 종료하세요.",
-                QSystemTrayIcon.MessageIcon.Information, 3000)
-            return
         self._stop_tg_poller()
         if HAS_KEYBOARD:
             try:
@@ -1931,8 +1889,6 @@ class MainWindow(QMainWindow):
         if self.worker.isRunning():
             self.worker.stop()
             self.worker.wait()
-        if self.tray:
-            self.tray.hide()
         super().closeEvent(event)
 
 # ---------------------------------------------------------
