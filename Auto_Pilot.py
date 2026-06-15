@@ -1069,42 +1069,20 @@ class ClaudeWorker(QThread):
             logging.debug(f"안정 토큰 OCR 실패: {e}")
             return False
 
-    def _check_token_ocr(self, claude_win, token: str) -> bool:
-        """응답 하단 띠를 OCR해 token(예: [STEP1_DONE])이 있으면 True."""
-        if claude_win is None or not self._ensure_ocr():
-            return False
-        try:
-            band_h = 420
-            bottom = int(claude_win.bottom - self.click_y_offset)
-            top    = int(max(0, bottom - band_h))
-            left   = int(max(0, claude_win.left + 20))
-            width  = int(max(1, claude_win.width - 40))
-            height = int(max(1, bottom - top))
-            shot   = pyautogui.screenshot(region=(left, top, width, height))
-            results = ocr_reader.readtext(np.array(shot))
-            raw = " ".join(t for _, t, _ in results)
-            raw_norm = re.sub(r'[^A-Z0-9_\[\]]', '', raw.upper())
-            tok_norm = re.sub(r'[^A-Z0-9_\[\]]', '', token.upper())
-            found = tok_norm in raw_norm
-            logging.info(f"🔍 [스텝 OCR] '{raw.strip()[:80]}' → {'감지' if found else '미감지'} ({token})")
-            return found
-        except Exception as e:
-            logging.debug(f"스텝 완료 OCR 실패: {e}")
-            return False
-
     # ── 스텝 모드 핵심 ─────────────────────────────────────
     def _check_step_complete(self, claude_win, frame=None) -> bool:
-        """현재 expected_step의 완료를 감지한다.
-        step{N}_complete*.png 가 있으면 템플릿 매칭, 없으면 OCR 폴백."""
+        """현재 expected_step의 완료를 step{N}_complete*.png 이미지 매칭으로만 감지한다."""
         n      = self.expected_step
         prefix = f"step{n}_complete"
-        if glob.glob(resource_path(f"{prefix}*.png")):
-            return self._match_any(prefix, claude_win, self.ready_confidence, frame)
-        # OCR 폴백: [STEP{N}_DONE] 토큰 검사
-        return self._check_token_ocr(claude_win, f"[STEP{n}_DONE]")
+        if not glob.glob(resource_path(f"{prefix}*.png")):
+            logging.warning(f"⚠️ {prefix}*.png 템플릿이 없어 Step {n} 완료를 감지할 수 없습니다.")
+            return False
+        return self._match_any(prefix, claude_win, self.ready_confidence, frame)
 
     def _build_step_prompt(self, step_idx: int) -> str:
-        """스텝 프롬프트 끝에 완료 토큰 지시어를 자동 합성한다 (step_idx: 0-based)."""
+        """스텝 프롬프트 끝에 완료 표식 지시어를 자동 합성한다 (step_idx: 0-based).
+        모델이 출력한 [STEP{N}_DONE] 텍스트를 캡처해 step{N}_complete.png 로 두면
+        이미지 매칭으로 완료를 감지한다."""
         n    = step_idx + 1
         base = self.steps[step_idx].strip()
         suffix = (
@@ -1610,25 +1588,20 @@ class MainWindow(QMainWindow):
 
         steps = self.get_steps()
 
-        # 사전 검증
+        # 사전 검증 — 스텝 완료는 이미지 매칭 전용이므로 스텝마다 완료 이미지가 필요하다.
         if steps:
-            no_detection = []
-            for i in range(1, len(steps) + 1):
-                has_img = bool(glob.glob(resource_path(f"step{i}_complete*.png")))
-                if not has_img and not HAS_OCR:
-                    no_detection.append(i)
-            if no_detection:
-                nums = ", ".join(str(n) for n in no_detection)
+            missing = [i for i in range(1, len(steps) + 1)
+                       if not glob.glob(resource_path(f"step{i}_complete*.png"))]
+            if missing:
+                nums = ", ".join(str(n) for n in missing)
                 QMessageBox.critical(
                     self, "사전 검증 실패",
-                    f"스텝 {nums}번: 완료 감지 이미지(step{{N}}_complete*.png)도 없고\n"
-                    f"OCR(easyocr)도 설치되지 않아 완료를 감지할 수 없습니다.\n\n"
-                    f"• resource 폴더에 이미지를 추가하거나\n"
-                    f"• pip install easyocr numpy 를 실행하세요."
+                    f"스텝 {nums}번: 완료 감지 이미지(step{{N}}_complete*.png)가 없습니다.\n\n"
+                    f"스텝 완료는 이미지 매칭으로만 감지합니다.\n"
+                    f"각 스텝의 완료 표식(예: [STEP{{N}}_DONE] 텍스트)을 캡처해\n"
+                    f"resource 폴더에 step{{N}}_complete.png 로 추가하세요."
                 )
                 return
-            if not HAS_OCR:
-                logging.warning("⚠️ easyocr 없음 — 스텝 완료 감지는 이미지 매칭으로만 동작합니다.")
 
         # 워커 초기화
         self.worker.steps           = steps
