@@ -1720,6 +1720,9 @@ class MainWindow(QMainWindow):
             self.move(screen_geom.right() - self.width() - 10,
                       screen_geom.bottom() - self.height() - 50)
 
+        # 텔레그램 양방향 폴러를 앱 시작 시점에 띄워 둔다 (감시 중지 후에도 원격 명령 수신).
+        self._start_tg_poller()
+
 
     # ── 스텝 관리 ─────────────────────────────────────────
     def add_step(self, _checked=False, text: str = ""):
@@ -1780,6 +1783,12 @@ class MainWindow(QMainWindow):
                           if self.worker.steps else "클래식 모드")
             reply(f"[Auto-Pilot] 상태: {self.worker.state.value} | {steps_info}"
                   f" | 연속모드: {'ON' if self.worker.continuous_mode else 'OFF'}")
+        elif cmd == "/start":
+            if self.worker.isRunning():
+                reply("[Auto-Pilot] 이미 감시가 실행 중입니다.")
+            else:
+                QTimer.singleShot(0, self.start_worker)
+                reply("[Auto-Pilot] ▶ 감시를 시작합니다.")
         elif cmd == "/stop":
             QTimer.singleShot(0, self.stop_worker)
             reply("[Auto-Pilot] 감시를 중지합니다.")
@@ -1819,16 +1828,17 @@ class MainWindow(QMainWindow):
             reply(
                 "[Auto-Pilot] 📋 명령어 목록\n"
                 "\n"
+                "/start — 감시 시작\n"
+                "/stop — 감시 완전 중지\n"
                 "/status — 현재 상태 조회\n"
                 "/screen — PC 화면 캡처 전송\n"
-                "/send [메시지] — 클로드에 직접 메시지 전송\n"
+                "/send [메시지] — 클로드에 직접 메시지 전송 (감시 중)\n"
                 "/pause — 연속 모드 OFF (자동 진행 멈춤)\n"
                 "/resume — 연속 모드 ON / PAUSED 재개\n"
                 "/next — 강제 다음 스텝으로 넘김\n"
-                "/stop — 감시 완전 중지\n"
                 "/help — 이 명령어 목록 표시\n"
                 "\n"
-                "※ 감시 시작 후에만 명령이 동작합니다.\n"
+                "※ 앱이 켜져 있으면 감시 중지 상태에서도 명령을 받습니다.\n"
                 "※ 30초 지난 명령은 자동 폐기됩니다."
             )
         else:
@@ -1920,13 +1930,13 @@ class MainWindow(QMainWindow):
         logging.info("감시가 중지되었습니다.")
 
     def _teardown_run_resources(self):
-        """F12 단축키·텔레그램 폴러 등 실행 중 자원을 해제한다."""
+        """F12 단축키 등 감시 실행 중에만 필요한 자원을 해제한다.
+        텔레그램 폴러는 앱이 켜져 있는 동안 계속 살려두므로 여기서 멈추지 않는다."""
         if HAS_KEYBOARD:
             try:
                 _keyboard_lib.remove_hotkey('f12')
             except Exception:
                 pass
-        self._stop_tg_poller()
 
     def _set_running_ui(self, running: bool):
         """메인·미니 시작/중지 버튼의 활성 상태를 함께 갱신한다."""
@@ -1972,6 +1982,9 @@ class MainWindow(QMainWindow):
 
     # ── 텔레그램 폴러 관리 ────────────────────────────────
     def _start_tg_poller(self):
+        # 이미 돌고 있으면 중복 시작하지 않는다 (앱 시작·감시 시작 양쪽에서 호출될 수 있음).
+        if self._tg_poller and self._tg_poller.isRunning():
+            return
         cfg = load_telegram_config()
         if not cfg or not cfg.get("bidirectional"):
             return
@@ -1979,6 +1992,11 @@ class MainWindow(QMainWindow):
         self._tg_poller.command_received.connect(self._on_telegram_command)
         self._tg_poller.start()
         logging.info("📨 텔레그램 양방향 제어 폴러 시작.")
+
+    def _restart_tg_poller(self):
+        """텔레그램 설정 변경 후 새 설정으로 폴러를 재시작한다."""
+        self._stop_tg_poller()
+        self._start_tg_poller()
 
     def _stop_tg_poller(self):
         if self._tg_poller and self._tg_poller.isRunning():
@@ -1995,6 +2013,8 @@ class MainWindow(QMainWindow):
 
     def open_telegram_settings(self):
         TelegramSettingsDialog(self).exec()
+        # 설정 변경(토큰/양방향 토글)을 즉시 반영하도록 폴러를 재시작
+        self._restart_tg_poller()
 
     # ── 기타 UI 슬롯 ──────────────────────────────────────
     def update_offset(self, value: int):
