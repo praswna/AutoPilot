@@ -1159,7 +1159,8 @@ class ClaudeWorker(QThread):
             return True
         return False
 
-    def _match_any(self, prefix: str, claude_win, base_conf: float, frame=None) -> bool:
+    def _match_any(self, prefix: str, claude_win, base_conf: float, frame=None,
+                   verbose: bool = False) -> bool:
         ladder = (
             (True,  base_conf),
             (True,  max(0.40, round(base_conf - 0.10, 2))),
@@ -1170,9 +1171,11 @@ class ClaudeWorker(QThread):
                 match = self._locate(img_path, claude_win, conf,
                                      use_grayscale=use_gray, frame=frame)
                 if match is not None:
-                    logging.info(f"✅ 이미지 매칭 성공: {os.path.basename(img_path)} (신뢰도={conf}, gray={use_gray})")
+                    if verbose:
+                        logging.info(f"✅ 이미지 매칭 성공: {os.path.basename(img_path)} (신뢰도={conf}, gray={use_gray})")
                     return True
-        logging.info(f"❌ 이미지 매칭 실패: {prefix}*.png (신뢰도={base_conf}~{max(0.40, round(base_conf-0.10,2))})")
+        if verbose:
+            logging.info(f"❌ 이미지 매칭 실패: {prefix}*.png (신뢰도={base_conf}~{max(0.40, round(base_conf-0.10,2))})")
         return False
 
     def _check_is_generating(self, claude_win, frame=None):
@@ -1233,7 +1236,7 @@ class ClaudeWorker(QThread):
             logging.warning(f"⚠️ {prefix}*.png 템플릿이 없어 Step {n} 완료를 감지할 수 없습니다.")
             return False
         logging.info(f"🔍 Step {n} 완료 이미지 매칭 시도: {[os.path.basename(t) for t in templates]}")
-        result = self._match_any(prefix, claude_win, self.ready_confidence, frame)
+        result = self._match_any(prefix, claude_win, self.ready_confidence, frame, verbose=True)
         if not result:
             logging.info(f"⏳ Step {n} 완료 미감지 — 신뢰도 {self.ready_confidence} 기준")
         return result
