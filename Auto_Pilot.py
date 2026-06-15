@@ -1,7 +1,7 @@
 # ==========================================
-# Auto-Pilot v1.3.0
+# Auto-Pilot v2.0.0
 # ==========================================
-VERSION = "1.3.0"
+VERSION = "2.0.0"
 
 import os
 import sys
@@ -9,43 +9,48 @@ import time
 import datetime
 import re
 import logging
-import logging.handlers  # [제안] app.log 크기 기준 롤오버용
-import glob  # [추가] 파일 패턴 검색을 위한 모듈
-import json       # 텔레그램 설정(telegram_config.json) 읽기용
-import tempfile   # 백로그 캡처 임시 저장용
-import urllib.request  # 텔레그램 API 호출용(외부 의존성 없이 stdlib 사용)
+import logging.handlers
+import glob
+import json
+import tempfile
+import urllib.request
 import urllib.parse
 import urllib.error
 from enum import Enum
 from collections import namedtuple
 
-# PyQt6 윈도우 DPI 관련 경고 메시지 숨김 처리
+# 전역 단축키 (선택적 의존성 — pip install keyboard)
+try:
+    import keyboard as _keyboard_lib
+    HAS_KEYBOARD = True
+except ImportError:
+    HAS_KEYBOARD = False
+
 os.environ["QT_LOGGING_RULES"] = "qt.qpa.window=false"
 
-# PyQt6 패키지
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QHBoxLayout, QPushButton, QCheckBox, QPlainTextEdit,
-                             QLabel, QDialog, QSpinBox, QDoubleSpinBox, QFormLayout, QLineEdit, QDialogButtonBox, QGroupBox,
-                             QSystemTrayIcon, QMenu, QMessageBox)
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QCheckBox, QPlainTextEdit, QLabel, QDialog, QSpinBox,
+    QDoubleSpinBox, QFormLayout, QLineEdit, QDialogButtonBox, QGroupBox,
+    QSystemTrayIcon, QMenu, QMessageBox, QScrollArea, QFrame, QSizePolicy,
+)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer, QObject
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QBrush
 
-# 의존성 패키지
 import pyautogui
 import pygetwindow as gw
 import pyperclip
 
-# [수정] 외부 프로그램 설치가 필요 없는 EasyOCR 라이브러리 사용
 try:
     import easyocr
     import numpy as np
     HAS_OCR = True
-    ocr_reader = None # OCR 엔진 지연 초기화용 변수
+    ocr_reader = None
 except ImportError:
     HAS_OCR = False
 
 # ---------------------------------------------------------
-# 1. 설정 및 상수 (Configuration)
+# 1. 설정 및 상수
 # ---------------------------------------------------------
 APP_NAME = "Auto-Pilot"
 TARGET_WINDOW_TITLE = "Claude"
@@ -55,36 +60,28 @@ EXCLUDE_TITLE_KEYWORDS = [
 ]
 CHECK_INTERVAL = 5
 FALLBACK_WAIT_MINUTES = 30
-CONFIDENCE_LEVEL = 0.8
 PAST_TIME_GRACE_MINUTES = 5
 MAX_INPUT_LEN = 4000
+MAX_CONTINUE_DEFAULT = 3       # 최대 "계속" 횟수 기본값
 
-# [제안 #2·#3] 화면 템플릿 매칭 기본 신뢰도 (환경 설정창에서 0.40~0.99 범위로 조정 가능).
-#   - 생성(■)/완료(↵)는 단계적 신뢰도 사다리의 기준값으로 쓰인다.
-#   - 한도 화면은 오탐 차단을 위해 더 엄격(컬러 비교)하게 둔다.
+STABLE_TOKEN = "LOOPSTABLE"   # 클래식 모드 종료 토큰
+
 GENERATING_CONFIDENCE = 0.80
-READY_CONFIDENCE = 0.80
-LIMIT_CONFIDENCE = 0.90
+READY_CONFIDENCE      = 0.80
+LIMIT_CONFIDENCE      = 0.90
 
-# [대기→완료] app.log 파일이 무한정 커지지 않도록 크기 기준 롤오버를 적용한다.
-LOG_MAX_BYTES = 2 * 1024 * 1024   # 2MB 도달 시 회전
-LOG_BACKUP_COUNT = 3              # app.log + .1 ~ .3 백업 유지
+LOG_MAX_BYTES   = 2 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
 
-# [제안 #1] 주기당 1회 캡처한 화면에서 찾은 좌표를 절대 화면 기준으로 담는 경량 박스.
-# pyautogui.Box(namedtuple)와 같은 필드(.left/.top/.width/.height)라 호출부 호환된다.
 ScreenBox = namedtuple("ScreenBox", "left top width height")
 
-# 계획이 안정되면 Claude가 응답 끝에 출력하는 토큰. OCR로 감지하면 연속 모드를 자동 종료한다.
-STABLE_TOKEN = "LOOPSTABLE"
-
-# 정지 시 텔레그램으로 백로그 캡처를 보낼 때 쓰는 설정 파일 (exe와 같은 폴더).
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(sys.executable)
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 TELEGRAM_CONFIG_PATH = os.path.join(APP_DIR, "telegram_config.json")
 
-# 스마트 프롬프트 (계획서 아티팩트 방식)
+# 클래식 모드용 스마트 프롬프트 (스텝 목록이 없을 때 사용)
 SMART_PROMPT = """[중요 지시사항: 아래 판단 흐름에 따라 현재 상황에 맞는 **단 하나의 STEP만** 실행할 것. 절대 여러 STEP을 한 번에 섞어서 실행하지 마라.]
 
 STEP 1: 미완성 답변 이어쓰기 (우선순위 1)
@@ -157,7 +154,6 @@ def app_icon() -> QIcon:
         icon = QIcon(ico_path)
         if not icon.isNull():
             return icon
-
     pixmap = QPixmap(64, 64)
     pixmap.fill(QColor(0, 0, 0, 0))
     painter = QPainter(pixmap)
@@ -176,9 +172,10 @@ def safe_clipboard_paste() -> str:
         logging.debug(f"클립보드 읽기 실패: {e}")
         return ""
 
-
+# ---------------------------------------------------------
+# 3. 텔레그램 헬퍼
+# ---------------------------------------------------------
 def load_telegram_config() -> dict | None:
-    """telegram_config.json 을 읽어 활성·필수값이 채워져 있으면 dict, 아니면 None."""
     try:
         with open(TELEGRAM_CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
@@ -194,10 +191,8 @@ def load_telegram_config() -> dict | None:
         return None
     return cfg
 
-
 def _multipart_encode(fields: dict, file_field: str, filename: str,
                       file_bytes: bytes, content_type: str) -> tuple[bytes, str]:
-    """단순 multipart/form-data 본문을 만든다 (외부 라이브러리 없이)."""
     boundary = "----AutoPilot" + os.urandom(16).hex()
     out = bytearray()
     for name, value in fields.items():
@@ -212,13 +207,10 @@ def _multipart_encode(fields: dict, file_field: str, filename: str,
     out += f"--{boundary}--\r\n".encode()
     return bytes(out), boundary
 
-
 def send_telegram_message(bot_token: str, chat_id: str, text: str) -> tuple[bool, str]:
-    """주어진 토큰/chat_id로 텍스트 메시지를 보낸다. (테스트용) (성공여부, 메시지) 반환."""
     if not bot_token or not chat_id:
         return False, "bot_token 또는 chat_id 가 비어 있습니다."
     try:
-        import urllib.parse
         params = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         req = urllib.request.Request(url, data=params, method="POST")
@@ -236,21 +228,16 @@ def send_telegram_message(bot_token: str, chat_id: str, text: str) -> tuple[bool
     except Exception as e:
         return False, f"오류: {e}"
 
-
 def send_telegram_text(text: str) -> bool:
-    """telegram_config.json 설정이 있으면 텍스트 메시지를 보낸다. 설정 없으면 조용히 건너뜀.
-    (정지 알림에 백로그 텍스트를 동봉할 때 사용)"""
     cfg = load_telegram_config()
     if not cfg:
         return False
     ok, msg = send_telegram_message(cfg["bot_token"], cfg["chat_id"], text)
     if not ok:
-        logging.warning(f"텔레그램 백로그 텍스트 전송 실패: {msg}")
+        logging.warning(f"텔레그램 텍스트 전송 실패: {msg}")
     return ok
 
-
 def send_telegram_photo(image_path: str, caption: str) -> bool:
-    """telegram_config.json 설정이 있으면 사진을 전송한다. 설정 없으면 조용히 건너뜀."""
     cfg = load_telegram_config()
     if not cfg:
         logging.info("텔레그램 설정이 없거나 비활성화됨 — 알림 전송 건너뜀.")
@@ -268,7 +255,7 @@ def send_telegram_photo(image_path: str, caption: str) -> bool:
         with urllib.request.urlopen(req, timeout=30) as resp:
             ok = 200 <= resp.status < 300
         if ok:
-            logging.info("📨 텔레그램으로 정지 알림(백로그 캡처)을 보냈습니다.")
+            logging.info("📨 텔레그램으로 알림(캡처)을 보냈습니다.")
         else:
             logging.warning(f"텔레그램 전송 응답 코드: {resp.status}")
         return ok
@@ -276,83 +263,71 @@ def send_telegram_photo(image_path: str, caption: str) -> bool:
         logging.error(f"텔레그램 전송 실패: {e}")
         return False
 
+def telegram_get_updates(bot_token: str, offset: int) -> list:
+    try:
+        url = (f"https://api.telegram.org/bot{bot_token}/getUpdates"
+               f"?offset={offset}&limit=10&timeout=3")
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get("result", [])
+    except Exception:
+        return []
+
+# ---------------------------------------------------------
+# 4. 시간 파싱
+# ---------------------------------------------------------
 def parse_target_time(text: str) -> datetime.datetime | None:
     if not text:
         return None
-
-    # [수정] 복사된 텍스트가 너무 길 경우 (대화내역 전체 복사 등), 맨 마지막이나 관련 키워드 주변만 탐색
     if len(text) > 500:
-        keyword_idx = max(text.rfind('재설정'), text.rfind('한도'), text.lower().rfind('limit'), text.lower().rfind('reset'))
+        keyword_idx = max(text.rfind('재설정'), text.rfind('한도'),
+                          text.lower().rfind('limit'), text.lower().rfind('reset'))
         if keyword_idx != -1:
             start = max(0, keyword_idx - 100)
-            end = min(len(text), keyword_idx + 100)
-            text = text[start:end]
+            end   = min(len(text), keyword_idx + 100)
+            text  = text[start:end]
         else:
             text = text[-500:]
-
-    # 보이지 않는 유니코드 제어문자 및 탭, 줄바꿈 등을 모두 제거/정규화
-    text = re.sub(r'[\u200b\u200c\u200d\u200e\u200f\ufeff]', '', text)
+    text = re.sub(r'[​‌‍‎‏﻿]', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
-
     hour, minute = None, None
     is_pm = '오후' in text or 'pm' in text.lower()
     is_am = '오전' in text or 'am' in text.lower()
-
-    # 1. XX:XX 또는 XX.XX 형태 (예: 5:30)
     match = re.search(r'(\d{1,2})\s*[:\.]\s*(\d{2})', text)
     if match:
-        hour = int(match.group(1))
-        minute = int(match.group(2))
+        hour, minute = int(match.group(1)), int(match.group(2))
     else:
-        # 2. X시 X분 형태
-        match_kr = re.search(r'(\d{1,2})\s*시\s*(\d{1,2})\s*분', text)
-        if match_kr:
-            hour = int(match_kr.group(1))
-            minute = int(match_kr.group(2))
+        m = re.search(r'(\d{1,2})\s*시\s*(\d{1,2})\s*분', text)
+        if m:
+            hour, minute = int(m.group(1)), int(m.group(2))
         else:
-            # 3. X시 형태
-            match_kr_hour = re.search(r'(\d{1,2})\s*시', text)
-            if match_kr_hour:
-                hour = int(match_kr_hour.group(1))
-                minute = 0
-
+            m2 = re.search(r'(\d{1,2})\s*시', text)
+            if m2:
+                hour, minute = int(m2.group(1)), 0
     if hour is None or minute is None:
         return None
-
-    # 시간 범위 방어
     if not (0 <= hour <= 24) or not (0 <= minute <= 59):
         return None
-
-    # AM/PM 처리 및 24시간제 변환
     if is_pm and hour < 12:
         hour += 12
     elif is_am and hour == 12:
         hour = 0
     elif hour == 24:
         hour = 0
-
     now = datetime.datetime.now()
-    target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-
-    # 과거 시간으로 잡혔을 경우 (다음 날로 설정하되, 몇 분 차이는 유예)
-    if target_time < now:
-        if (now - target_time) <= datetime.timedelta(minutes=PAST_TIME_GRACE_MINUTES):
-            target_time = now
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target < now:
+        if (now - target) <= datetime.timedelta(minutes=PAST_TIME_GRACE_MINUTES):
+            target = now
+        elif not is_am and not is_pm and hour < 12:
+            pm_time = target.replace(hour=hour + 12)
+            target = pm_time if pm_time > now else target + datetime.timedelta(days=1)
         else:
-            # AM/PM 표시가 없고 현재 시간보다 과거라면 (예: 현재 14시인데 5:30으로 잡힌 경우 -> 17:30으로 추론)
-            if not is_am and not is_pm and hour < 12:
-                pm_time = target_time.replace(hour=hour + 12)
-                if pm_time > now:
-                    target_time = pm_time
-                else:
-                    target_time += datetime.timedelta(days=1)
-            else:
-                target_time += datetime.timedelta(days=1)
-
-    return target_time
+            target += datetime.timedelta(days=1)
+    return target
 
 # ---------------------------------------------------------
-# 3. 로깅 시그널 및 핸들러 (GUI용)
+# 5. 로깅 시그널 및 핸들러
 # ---------------------------------------------------------
 class Signaller(QObject):
     signal = pyqtSignal(str, logging.LogRecord)
@@ -369,7 +344,7 @@ class QTextEditLogger(logging.Handler):
         self.signaller.signal.emit(msg, record)
 
 # ---------------------------------------------------------
-# 4. 토스트 알림 팝업
+# 6. 토스트 알림
 # ---------------------------------------------------------
 class ToastNotification(QDialog):
     def __init__(self, message, duration=3000):
@@ -380,71 +355,64 @@ class ToastNotification(QDialog):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-
         layout = QVBoxLayout()
         label = QLabel(message)
         label.setStyleSheet("""
             QLabel {
-                background-color: #2D2D2D;
-                color: #FFFFFF;
-                padding: 15px;
-                border-radius: 5px;
+                background-color: #2D2D2D; color: #FFFFFF;
+                padding: 15px; border-radius: 5px;
                 font-family: 'Malgun Gothic', sans-serif;
-                font-size: 11pt;
-                font-weight: bold;
+                font-size: 11pt; font-weight: bold;
             }
         """)
         layout.addWidget(label)
         self.setLayout(layout)
-
         screen = QApplication.primaryScreen().geometry()
-        x = screen.width() - 350
-        y = screen.height() - 150
-        self.move(x, y)
+        self.move(screen.width() - 350, screen.height() - 150)
         QTimer.singleShot(duration, self.close)
 
 # ---------------------------------------------------------
-# 5. 오토파일럿 워커 스레드 (비동기 처리)
+# 7. 상태 머신 및 기본 메시지
 # ---------------------------------------------------------
 class State(Enum):
-    IDLE = "IDLE"
+    IDLE      = "IDLE"
     MONITORING = "MONITORING"
-    WAITING = "WAITING"
     GENERATING = "GENERATING"
-    RESUMING = "RESUMING"
+    WAITING   = "WAITING"
+    RESUMING  = "RESUMING"
+    PAUSED    = "PAUSED"    # 자동 일시 정지 (수동 개입 필요)
 
 DEFAULT_MESSAGES = {
-    State.IDLE: "클로드 앱이 닫혀 있습니다. 창이 켜지기를 대기 중입니다.",
+    State.IDLE:       "클로드 앱이 닫혀 있습니다. 창이 켜지기를 대기 중입니다.",
     State.MONITORING: "클로드가 '대기 중(입력 가능)' 상태입니다. (연속 모드: {mode})",
     State.GENERATING: "클로드가 현재 '답변을 작성'하고 있습니다.",
-    State.WAITING: "사용량 한도 초과 상태입니다. 휴식 중 (재개 예정: {time})",
-    State.RESUMING: "클로드에게 다음 작업을 지시(프롬프트 전송)하는 중입니다."
+    State.WAITING:    "사용량 한도 초과 상태입니다. 휴식 중 (재개 예정: {time})",
+    State.RESUMING:   "클로드에게 다음 작업을 지시(프롬프트 전송)하는 중입니다.",
+    State.PAUSED:     "⚠️ 자동 일시 정지 — [강제 다음 스텝] 또는 [재개]를 눌러주세요. ({reason})",
 }
 
+# ---------------------------------------------------------
+# 8. 텔레그램 설정 다이얼로그
+# ---------------------------------------------------------
 class TelegramSettingsDialog(QDialog):
-    """텔레그램 정지 알림 설정 + 사용법 안내 + 테스트 전송 (앱 내장)."""
-
     GUIDE = (
-        "<b>📨 텔레그램 정지 알림 설정</b><br><br>"
-        "연속 모드가 <b>계획 안정(LOOPSTABLE)</b>으로 자동 정지될 때, "
-        "Claude 창 캡처(백로그 포함)를 텔레그램으로 보냅니다.<br><br>"
-        "<b>① 봇 토큰 받기</b><br>"
-        "텔레그램에서 <b>@BotFather</b> 검색 → <b>/newbot</b> → 안내대로 진행하면 "
-        "봇 <b>토큰</b>을 줍니다. 그 토큰을 아래 '봇 토큰'에 붙여넣으세요.<br><br>"
-        "<b>② 내 chat id 받기</b><br>"
-        "방금 만든 봇과 대화를 시작(아무 메시지 전송)한 뒤, "
-        "<b>@userinfobot</b> 에게 말을 걸면 내 <b>id</b> 숫자를 알려줍니다. "
-        "그 숫자를 '내 chat id'에 입력하세요.<br><br>"
-        "<b>③ 테스트 → 저장</b><br>"
-        "'테스트 전송'으로 메시지가 오는지 확인하고, '알림 사용'을 켠 뒤 '저장'하세요.<br>"
-        "<i>※ 토큰은 비밀번호 같은 값이니 외부에 공유하지 마세요.</i>"
+        "<b>📨 텔레그램 알림 + 양방향 제어 설정</b><br><br>"
+        "정지·완료 시 캡처를 전송하고, 봇 명령으로 원격 제어할 수 있습니다.<br><br>"
+        "<b>① 봇 토큰</b>: @BotFather → /newbot 으로 발급<br>"
+        "<b>② chat id</b>: 봇에게 아무 메시지 전송 후 @userinfobot 으로 확인<br><br>"
+        "<b>명령어 목록</b> (양방향 사용 시):<br>"
+        "&nbsp;&nbsp;/status — 현재 상태 조회<br>"
+        "&nbsp;&nbsp;/stop — 감시 중지<br>"
+        "&nbsp;&nbsp;/pause — 연속 모드 중단<br>"
+        "&nbsp;&nbsp;/resume — 연속 모드 재개<br>"
+        "&nbsp;&nbsp;/next — 강제 다음 스텝<br><br>"
+        "<i>※ 봇 토큰은 외부에 공유하지 마세요.</i>"
     )
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("텔레그램 정지 알림 설정")
-        self.resize(520, 560)
-
+        self.setWindowTitle("텔레그램 설정")
+        self.resize(520, 600)
         layout = QVBoxLayout(self)
 
         guide = QLabel(self.GUIDE)
@@ -454,16 +422,19 @@ class TelegramSettingsDialog(QDialog):
         layout.addWidget(guide)
 
         form = QFormLayout()
-        self.cb_enabled = QCheckBox("알림 사용 (정지 시 텔레그램으로 캡처 전송)")
+        self.cb_enabled = QCheckBox("알림 사용 (정지·완료 시 캡처 전송)")
         form.addRow(self.cb_enabled)
 
+        self.cb_bidirectional = QCheckBox("양방향 제어 사용 (봇 명령 수신)")
+        form.addRow(self.cb_bidirectional)
+
         self.edit_token = QLineEdit()
-        self.edit_token.setPlaceholderText("예: 123456789:ABCd... (BotFather가 준 토큰)")
+        self.edit_token.setPlaceholderText("123456789:ABCd...")
         self.edit_token.setEchoMode(QLineEdit.EchoMode.Password)
         form.addRow("봇 토큰:", self.edit_token)
 
         self.edit_chat = QLineEdit()
-        self.edit_chat.setPlaceholderText("예: 987654321 (숫자 id)")
+        self.edit_chat.setPlaceholderText("987654321")
         form.addRow("내 chat id:", self.edit_chat)
         layout.addLayout(form)
 
@@ -489,7 +460,7 @@ class TelegramSettingsDialog(QDialog):
 
         self._load_existing()
 
-    def _toggle_token_echo(self, _state):
+    def _toggle_token_echo(self, _):
         self.edit_token.setEchoMode(
             QLineEdit.EchoMode.Normal if self.cb_show_token.isChecked()
             else QLineEdit.EchoMode.Password
@@ -500,6 +471,7 @@ class TelegramSettingsDialog(QDialog):
             with open(TELEGRAM_CONFIG_PATH, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             self.cb_enabled.setChecked(bool(cfg.get("enabled")))
+            self.cb_bidirectional.setChecked(bool(cfg.get("bidirectional")))
             self.edit_token.setText(str(cfg.get("bot_token", "")))
             self.edit_chat.setText(str(cfg.get("chat_id", "")))
         except Exception:
@@ -515,9 +487,10 @@ class TelegramSettingsDialog(QDialog):
 
     def _on_save(self):
         cfg = {
-            "enabled": self.cb_enabled.isChecked(),
-            "bot_token": self.edit_token.text().strip(),
-            "chat_id": self.edit_chat.text().strip(),
+            "enabled":       self.cb_enabled.isChecked(),
+            "bidirectional": self.cb_bidirectional.isChecked(),
+            "bot_token":     self.edit_token.text().strip(),
+            "chat_id":       self.edit_chat.text().strip(),
         }
         try:
             with open(TELEGRAM_CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -528,211 +501,277 @@ class TelegramSettingsDialog(QDialog):
             self.lbl_result.setText(f"❌ 저장 실패: {e}")
             self.lbl_result.setStyleSheet("color: #e74c3c; padding: 2px;")
 
+# ---------------------------------------------------------
+# 9. 텔레그램 양방향 폴러 스레드
+# ---------------------------------------------------------
+class TelegramPollerThread(QThread):
+    """Telegram getUpdates를 5초마다 폴링해 봇 명령을 수신한다."""
+    command_received = pyqtSignal(str)   # "/status", "/stop", ...
 
+    def __init__(self, bot_token: str, chat_id: str):
+        super().__init__()
+        self.bot_token = bot_token
+        self.chat_id   = chat_id
+        self.running   = True
+        self._last_update_id = 0
+
+    def run(self):
+        while self.running:
+            try:
+                updates = telegram_get_updates(self.bot_token, self._last_update_id + 1)
+                for upd in updates:
+                    uid = upd.get("update_id", 0)
+                    if uid > self._last_update_id:
+                        self._last_update_id = uid
+                    msg  = upd.get("message", {})
+                    text = msg.get("text", "").strip()
+                    from_id = str(msg.get("from", {}).get("id", ""))
+                    # chat_id 필터: 설정된 계정에서 보낸 명령만 처리
+                    if text.startswith("/") and from_id == self.chat_id:
+                        self.command_received.emit(text.split()[0])
+            except Exception as e:
+                logging.debug(f"텔레그램 폴링 오류: {e}")
+            self._sleep(5)
+
+    def stop(self):
+        self.running = False
+
+    def _sleep(self, seconds: float):
+        end = time.time() + seconds
+        while self.running and time.time() < end:
+            time.sleep(0.1)
+
+# ---------------------------------------------------------
+# 10. 환경 설정 다이얼로그
+# ---------------------------------------------------------
 class MessageSettingsDialog(QDialog):
-    def __init__(self, current_messages, current_prompt, current_conf, parent=None):
+    def __init__(self, current_messages, current_prompt, current_conf,
+                 max_continue, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("상황별 메시지 및 설정")
-        self.resize(550, 720)
-        
+        self.setWindowTitle("환경 설정")
+        self.resize(560, 780)
         layout = QVBoxLayout(self)
 
-        # 상황별 메시지 설정 그룹
-        msg_group = QGroupBox("상황별 로그 메시지 설정")
-        form_layout = QFormLayout()
-        
+        # 상황별 메시지
+        msg_group = QGroupBox("상황별 로그 메시지")
+        form = QFormLayout()
         self.inputs = {}
         labels = {
-            State.IDLE: "대기 중 (창 닫힘):",
+            State.IDLE:       "대기 중 (창 닫힘):",
             State.MONITORING: "감시 중 (입력 대기):",
             State.GENERATING: "답변 작성 중:",
-            State.WAITING: "한도 초과 대기:",
-            State.RESUMING: "작업 지시 중:"
+            State.WAITING:    "한도 초과 대기:",
+            State.RESUMING:   "작업 지시 중:",
+            State.PAUSED:     "자동 일시 정지:",
         }
-        
-        for state, label_text in labels.items():
-            line_edit = QLineEdit(current_messages[state])
-            self.inputs[state] = line_edit
-            form_layout.addRow(label_text, line_edit)
-            
-        msg_group.setLayout(form_layout)
+        for state, lbl in labels.items():
+            le = QLineEdit(current_messages[state])
+            self.inputs[state] = le
+            form.addRow(lbl, le)
+        msg_group.setLayout(form)
         layout.addWidget(msg_group)
-        
-        info_label = QLabel("※ '{mode}'는 ON/OFF로, '{time}'은 시간으로 자동 치환됩니다.")
-        info_label.setStyleSheet("color: #888888; font-size: 9pt;")
-        layout.addWidget(info_label)
+        layout.addWidget(QLabel("※ '{mode}' ON/OFF, '{time}' 시간, '{reason}' 사유로 자동 치환됩니다."))
 
-        # 화면 인식 신뢰도 설정 그룹 (제안 #2·#3)
-        conf_group = QGroupBox("화면 인식 신뢰도 (0.40~0.99 · 높을수록 엄격, 오탐↓ 미탐↑)")
+        # 화면 인식 신뢰도
+        conf_group = QGroupBox("화면 인식 신뢰도 (0.40~0.99)")
         conf_form = QFormLayout()
         self.conf_inputs = {}
         conf_labels = {
-            "generating": "답변 작성 중(■) 감지:",
-            "ready": "입력 대기(↵) 감지:",
-            "limit": "사용량 한도 화면 감지:",
+            "generating": "답변 작성 중(■):",
+            "ready":      "입력 대기(↵):",
+            "limit":      "사용량 한도 화면:",
         }
-        for key, label_text in conf_labels.items():
-            spin = QDoubleSpinBox()
-            spin.setRange(0.40, 0.99)
-            spin.setSingleStep(0.01)
-            spin.setDecimals(2)
-            spin.setValue(float(current_conf.get(key, 0.80)))
-            self.conf_inputs[key] = spin
-            conf_form.addRow(label_text, spin)
+        for key, lbl in conf_labels.items():
+            sp = QDoubleSpinBox()
+            sp.setRange(0.40, 0.99)
+            sp.setSingleStep(0.01)
+            sp.setDecimals(2)
+            sp.setValue(float(current_conf.get(key, 0.80)))
+            self.conf_inputs[key] = sp
+            conf_form.addRow(lbl, sp)
         conf_group.setLayout(conf_form)
         layout.addWidget(conf_group)
 
-        conf_info = QLabel("※ 생성/대기 감지는 이 값을 기준으로 흑백·컬러 신뢰도를 단계적으로 낮춰가며 재시도합니다.")
-        conf_info.setStyleSheet("color: #888888; font-size: 9pt;")
-        conf_info.setWordWrap(True)
-        layout.addWidget(conf_info)
+        # 스텝 모드 설정
+        step_group = QGroupBox("스텝 모드 설정")
+        step_form = QFormLayout()
+        self.spin_max_continue = QSpinBox()
+        self.spin_max_continue.setRange(1, 20)
+        self.spin_max_continue.setValue(max_continue)
+        step_form.addRow("최대 '계속' 횟수 (초과 시 자동 정지):", self.spin_max_continue)
+        step_group.setLayout(step_form)
+        layout.addWidget(step_group)
 
-        # 스마트 프롬프트 설정 그룹
-        prompt_group = QGroupBox("스마트 프롬프트 설정 (입력창 비어있을 때 자동 전송할 텍스트)")
-        prompt_layout = QVBoxLayout()
+        # 클래식 모드 스마트 프롬프트
+        prompt_group = QGroupBox("클래식 모드 스마트 프롬프트 (스텝 없을 때)")
+        pl = QVBoxLayout()
         self.prompt_edit = QPlainTextEdit(current_prompt)
-        prompt_layout.addWidget(self.prompt_edit)
-        prompt_group.setLayout(prompt_layout)
+        pl.addWidget(self.prompt_edit)
+        prompt_group.setLayout(pl)
         layout.addWidget(prompt_group)
-        
-        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-        
-    def get_values(self):
-        new_messages = {state: edit.text() for state, edit in self.inputs.items()}
-        new_prompt = self.prompt_edit.toPlainText()
-        new_conf = {key: spin.value() for key, spin in self.conf_inputs.items()}
-        return new_messages, new_prompt, new_conf
 
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+    def get_values(self):
+        return (
+            {state: le.text() for state, le in self.inputs.items()},
+            self.prompt_edit.toPlainText(),
+            {key: sp.value() for key, sp in self.conf_inputs.items()},
+            self.spin_max_continue.value(),
+        )
+
+# ---------------------------------------------------------
+# 11. 스텝 아이템 위젯
+# ---------------------------------------------------------
+class StepItemWidget(QFrame):
+    delete_requested = pyqtSignal(object)
+
+    def __init__(self, index: int, text: str = "", parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self._index = index
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+
+        self.lbl_num = QLabel(f"#{index}")
+        self.lbl_num.setFixedWidth(28)
+        self.lbl_num.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_num.setStyleSheet("font-weight: bold; color: #8be9fd;")
+        layout.addWidget(self.lbl_num)
+
+        self.text_edit = QPlainTextEdit(text)
+        self.text_edit.setFixedHeight(75)
+        self.text_edit.setPlaceholderText(f"Step {index} 프롬프트를 입력하세요...")
+        self.text_edit.setStyleSheet(
+            "background-color: #252526; color: #d4d4d4; border: 1px solid #3c3c3c;"
+            "border-radius: 3px; font-family: Consolas, monospace; font-size: 9pt;"
+        )
+        layout.addWidget(self.text_edit)
+
+        self.btn_del = QPushButton("✕")
+        self.btn_del.setFixedSize(26, 26)
+        self.btn_del.setStyleSheet(
+            "QPushButton { background-color: #c0392b; color: white; border-radius: 4px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #e74c3c; }"
+        )
+        self.btn_del.clicked.connect(lambda: self.delete_requested.emit(self))
+        layout.addWidget(self.btn_del)
+
+    def get_text(self) -> str:
+        return self.text_edit.toPlainText()
+
+    def set_index(self, index: int):
+        self._index = index
+        self.lbl_num.setText(f"#{index}")
+
+    def set_locked(self, locked: bool):
+        self.text_edit.setReadOnly(locked)
+        self.btn_del.setEnabled(not locked)
+
+    def set_active(self, active: bool, done: bool = False):
+        if done:
+            self.setStyleSheet("QFrame { border: 2px solid #555; border-radius: 4px; }")
+            self.lbl_num.setStyleSheet("font-weight: bold; color: #555; text-decoration: line-through;")
+        elif active:
+            self.setStyleSheet("QFrame { border: 2px solid #2ecc71; border-radius: 4px; background: rgba(46,204,113,0.05); }")
+            self.lbl_num.setStyleSheet("font-weight: bold; color: #2ecc71;")
+        else:
+            self.setStyleSheet("")
+            self.lbl_num.setStyleSheet("font-weight: bold; color: #8be9fd;")
+
+# ---------------------------------------------------------
+# 12. 오토파일럿 워커 스레드
+# ---------------------------------------------------------
 class ClaudeWorker(QThread):
-    toast_signal = pyqtSignal(str)
-    continuous_mode_changed = pyqtSignal(bool)  # 자동 정지 시 GUI 체크박스 동기화용
+    toast_signal             = pyqtSignal(str)
+    continuous_mode_changed  = pyqtSignal(bool)
+    step_progress_signal     = pyqtSignal(int, int)   # (current 1-based, total)
+    auto_paused_signal       = pyqtSignal(str)         # pause reason
 
     def __init__(self):
         super().__init__()
-        self.state = State.IDLE
-        self.running = True
-        self.target_time = None
+        self.state           = State.IDLE
+        self.running         = True
+        self.target_time     = None
         self.continuous_mode = False
-        self.click_y_offset = 110
+        self.click_y_offset  = 110
 
-        # [제안 #2·#3] 화면 인식 신뢰도 (환경 설정창에서 조정)
+        # 신뢰도
         self.generating_confidence = GENERATING_CONFIDENCE
-        self.ready_confidence = READY_CONFIDENCE
-        self.limit_confidence = LIMIT_CONFIDENCE
+        self.ready_confidence      = READY_CONFIDENCE
+        self.limit_confidence      = LIMIT_CONFIDENCE
 
-        self.last_status_msg = ""
-        self.status_messages = DEFAULT_MESSAGES.copy()
-        self.smart_prompt = SMART_PROMPT
+        # 스텝 모드
+        self.steps          : list[str] = []
+        self.expected_step  : int = 1    # 1-based
+        self.continue_count : int = 0
+        self.max_continue   : int = MAX_CONTINUE_DEFAULT
+        self._pause_reason  : str = ""
 
+        self.last_status_msg  = ""
+        self.status_messages  = DEFAULT_MESSAGES.copy()
+        self.smart_prompt     = SMART_PROMPT
+
+    # ── 메인 루프 ──────────────────────────────────────────
     def run(self):
         self.running = True
-        self.state = State.IDLE
+        self.state   = State.IDLE
         self.last_status_msg = ""
-        
         logging.info("=========================================")
-        logging.info(f"{APP_NAME} 감시 스레드를 시작합니다.")
-        # 리소스 파일 체크
+        logging.info(f"{APP_NAME} v{VERSION} 감시 스레드를 시작합니다.")
         self._check_resources()
+        if self.steps:
+            logging.info(f"📋 스텝 모드: 총 {len(self.steps)}개 스텝, Step {self.expected_step}부터 시작.")
+        else:
+            logging.info("📋 클래식 모드 (스마트 프롬프트).")
         logging.info("=========================================")
-
         while self.running:
             try:
                 self._update_state()
             except pyautogui.FailSafeException:
-                logging.error("마우스가 화면 모서리로 이동하여 FailSafe가 발동되었습니다. 루프를 재개합니다.")
+                logging.error("FailSafe 발동 — 루프를 재개합니다.")
             except Exception as e:
-                logging.error(f"루프 실행 중 에러 발생: {e}")
-            
+                logging.error(f"루프 실행 중 에러: {e}")
             self._interruptible_sleep(CHECK_INTERVAL)
 
     def stop(self):
         self.running = False
 
-    def _check_resources(self):
-        """이미지 파일 누락 여부 확인"""
-        missing = []
-        if not os.path.exists(resource_path("generating.png")):
-            missing.append("generating.png")
-            
-        # [수정] limit_warning으로 시작하는 파일이 1개라도 있는지 검사
-        limit_imgs = glob.glob(resource_path("limit_warning*.png"))
-        if not limit_imgs:
-            missing.append("limit_warning*.png (최소 1개 이상 필요)")
-            
-        if missing:
-            logging.warning(f"⚠️ 경고: 이미지 인식용 파일이 누락되었습니다: {', '.join(missing)}")
-            logging.warning("해당 기능(답변 중 감지, 한도 초과 감지)이 정상 작동하지 않을 수 있습니다.")
+    def force_next_step(self):
+        """수동으로 다음 스텝으로 강제 이동 (GUI 슬롯에서 호출)."""
+        if not self.steps:
+            return
+        self.continue_count = 0
+        self.expected_step  = min(self.expected_step + 1, len(self.steps) + 1)
+        logging.info(f"⏭ 강제 다음 스텝 → Step {self.expected_step}/{len(self.steps)}")
+        if self.state == State.PAUSED:
+            if self.expected_step > len(self.steps):
+                self.continuous_mode = False
+                self.continuous_mode_changed.emit(False)
+                self.state = State.MONITORING
+            else:
+                self.state = State.RESUMING
+        self.step_progress_signal.emit(self.expected_step, len(self.steps))
 
-    def _interruptible_sleep(self, seconds):
-        end = time.time() + seconds
-        while self.running and time.time() < end:
-            time.sleep(0.1)
-
-    def get_claude_window(self):
-        if sys.platform != 'win32':
-            logging.error("pygetwindow는 현재 Windows만 공식 지원합니다.")
-            return None
-            
-        candidates = []
-        try:
-            for w in gw.getWindowsWithTitle(TARGET_WINDOW_TITLE):
-                title = w.title or ""
-                if title == APP_NAME:
-                    continue
-                if any(bad in title for bad in EXCLUDE_TITLE_KEYWORDS):
-                    continue
-                candidates.append(w)
-        except Exception as e:
-            logging.debug(f"창 검색 중 오류 발생: {e}")
-
-        for w in candidates:
-            if w.title == TARGET_WINDOW_TITLE:
-                return w
-        return candidates[0] if candidates else None
-
-    def _log_status_change(self):
-        current_status = ""
-        
-        if self.state == State.IDLE:
-            current_status = self.status_messages[State.IDLE]
-        elif self.state == State.MONITORING:
-            mode_str = "ON" if self.continuous_mode else "OFF"
-            current_status = self.status_messages[State.MONITORING].replace("{mode}", mode_str)
-        elif self.state == State.GENERATING:
-            current_status = self.status_messages[State.GENERATING]
-        elif self.state == State.WAITING:
-            target_str = self.target_time.strftime('%H:%M:%S') if self.target_time else '미정'
-            current_status = self.status_messages[State.WAITING].replace("{time}", target_str)
-        elif self.state == State.RESUMING:
-            current_status = self.status_messages[State.RESUMING]
-
-        if current_status != self.last_status_msg:
-            logging.info(f"💡 [상태 변경] {current_status}")
-            self.last_status_msg = current_status
-
+    # ── 상태 갱신 ──────────────────────────────────────────
     def _update_state(self):
-        claude_win = self.get_claude_window()
+        claude_win    = self.get_claude_window()
         is_claude_open = claude_win is not None
 
-        # [제안 #1] 이번 주기에 쓸 화면을 한 번만 캡처해 모든 템플릿 매칭에 재사용한다.
-        #           (창마다 generating*·limit_warning*·ready* 여러 장을 매번 새로 캡처하던 비용 제거)
-        #           WAITING 단계는 아래에서 frame을 쓰지 않으므로 캡처 자체를 건너뛴다.
-        frame = self._grab_window_frame(claude_win) if (is_claude_open and self.state != State.WAITING) else None
+        frame = (self._grab_window_frame(claude_win)
+                 if is_claude_open and self.state not in (State.WAITING, State.PAUSED)
+                 else None)
 
-        # [개선] 1. 창이 열려있고 이미 대기(WAITING) 중인 상태가 아니라면, 한도 초과 여부부터 최우선 검사
-        if is_claude_open and self.state != State.WAITING:
-            is_limited = self._check_for_rate_limit(claude_win, frame)
-            if is_limited:
+        if is_claude_open and self.state not in (State.WAITING, State.PAUSED):
+            if self._check_for_rate_limit(claude_win, frame):
                 self._log_status_change()
                 return
 
-        # 2. 한도 초과가 아닐 때만 답변 생성 중/완료 여부 검사
-        #    생성(■)과 완료(↵) 두 신호를 함께 보고, ready 템플릿이 있으면
-        #    완료는 ready(↵)가 보일 때만 '확정'한다. 둘 다 애매하면 상태를 유지(오판 방지).
-        is_generating = False
+        is_generating  = False
         done_confirmed = True
         if is_claude_open and self.state in (State.MONITORING, State.GENERATING):
             is_generating = self._check_is_generating(claude_win, frame)
@@ -741,7 +780,6 @@ class ClaudeWorker(QThread):
 
         self._log_status_change()
 
-        # --- 상태 머신 전환 로직 ---
         if self.state == State.IDLE:
             if is_claude_open:
                 logging.info(f"[{TARGET_WINDOW_TITLE}] 창이 감지되었습니다. 감시를 시작합니다.")
@@ -752,54 +790,41 @@ class ClaudeWorker(QThread):
                 logging.info("클로드 창이 닫혔습니다. 대기 모드로 전환합니다.")
                 self.state = State.IDLE
                 return
-
             if is_generating:
                 if self.state != State.GENERATING:
                     self.state = State.GENERATING
             elif not done_confirmed:
-                # 생성(■)도 완료(↵)도 확인 안 됨 → 모호 상태. 다음 주기까지 현재 상태 유지.
-                pass
+                pass  # 모호한 상태 — 다음 주기까지 유지
             else:
                 if self.state == State.GENERATING:
                     logging.info("답변 작성이 완료되었습니다! 5초 대기 후 다음 단계를 진행합니다.")
                     self._interruptible_sleep(5)
-                    if self.continuous_mode and self._check_loop_stable(claude_win):
-                        logging.info("🛑 계획 안정(LOOPSTABLE) 감지 — 연속 모드를 끄고 대기합니다.")
-                        self.continuous_mode = False
-                        self.continuous_mode_changed.emit(False)
-                        self._notify_stable(claude_win)
-                        self.state = State.MONITORING
-                    elif self.continuous_mode:
-                        self.state = State.RESUMING
-                    else:
-                        self.state = State.MONITORING
-                elif self.state == State.MONITORING:
-                    if self.continuous_mode:
-                        logging.info("무한 연속 모드 ON: 즉시 다음 작업을 지시합니다.")
-                        self.state = State.RESUMING
+                    self._handle_generation_done(claude_win, frame)
+                elif self.state == State.MONITORING and self.continuous_mode:
+                    logging.info("연속 모드 ON: 즉시 다음 작업을 지시합니다.")
+                    self.state = State.RESUMING
+
+        elif self.state == State.PAUSED:
+            if not is_claude_open:
+                self.state = State.IDLE
+            # 사용자 수동 개입 대기 — 자동으로 상태 전환하지 않음
 
         elif self.state == State.WAITING:
             if not is_claude_open:
-                logging.info("대기 중 클로드 창이 닫혔습니다. 대기를 취소합니다.")
+                logging.info("대기 중 클로드 창이 닫혔습니다.")
                 self.target_time = None
                 self.state = State.IDLE
                 return
-
             if not self.target_time:
                 self.state = State.MONITORING
                 return
-
-            # 한도 화면이 이미 사라졌다면(=리셋됨) 예정 시각과 무관하게 즉시 재개한다.
-            # OCR이 재개 시각을 잘못 읽어 미래(오후/내일)로 잡혀도 여기서 자가 복구된다.
             limit_pos, _ = self._locate_rate_limit(claude_win)
             if limit_pos is None:
-                logging.info("한도 화면이 사라졌습니다(리셋 추정). 예정 시각과 무관하게 재개합니다.")
+                logging.info("한도 화면이 사라졌습니다(리셋). 즉시 재개합니다.")
                 self.target_time = None
                 self.state = State.RESUMING
                 return
-
-            now = datetime.datetime.now()
-            if now >= self.target_time:
+            if datetime.datetime.now() >= self.target_time:
                 logging.info("대기 시간이 종료되었습니다. 재개를 시도합니다.")
                 self.state = State.RESUMING
 
@@ -808,22 +833,118 @@ class ClaudeWorker(QThread):
             self.target_time = None
             self.state = State.MONITORING
 
+    def _handle_generation_done(self, claude_win, frame):
+        """답변 완료 후 스텝 모드 / 클래식 모드로 분기."""
+        if self.continuous_mode and self.steps:
+            step_done = self._check_step_complete(claude_win, frame)
+            if step_done:
+                logging.info(f"✅ Step {self.expected_step}/{len(self.steps)} 완료 확인!")
+                self.continue_count = 0
+                self.expected_step += 1
+                self.step_progress_signal.emit(self.expected_step - 1, len(self.steps))
+                if self.expected_step > len(self.steps):
+                    logging.info("🎉 모든 스텝이 완료되었습니다!")
+                    self.continuous_mode = False
+                    self.continuous_mode_changed.emit(False)
+                    self._notify_all_done(claude_win)
+                    self.state = State.MONITORING
+                else:
+                    self.state = State.RESUMING
+            else:
+                self.continue_count += 1
+                logging.info(f"Step {self.expected_step} 완료 미감지 ({self.continue_count}/{self.max_continue})")
+                if self.continue_count >= self.max_continue:
+                    self._pause_reason = (
+                        f"Step {self.expected_step} 완료 토큰이 {self.continue_count}회 연속 미감지"
+                    )
+                    logging.warning(f"⚠️ 자동 일시 정지 — {self._pause_reason}")
+                    self.state = State.PAUSED
+                    self.auto_paused_signal.emit(self._pause_reason)
+                else:
+                    self.state = State.RESUMING  # "계속 이어서 작성해 줘" 전송
+
+        elif self.continuous_mode:
+            # 클래식 모드
+            if self._check_loop_stable(claude_win):
+                logging.info("🛑 LOOPSTABLE 감지 — 연속 모드를 끄고 대기합니다.")
+                self.continuous_mode = False
+                self.continuous_mode_changed.emit(False)
+                self._notify_stable(claude_win)
+                self.state = State.MONITORING
+            else:
+                self.state = State.RESUMING
+        else:
+            self.state = State.MONITORING
+
+    # ── 로깅 ───────────────────────────────────────────────
+    def _log_status_change(self):
+        s = self.state
+        m = self.status_messages
+        if s == State.IDLE:
+            cur = m[State.IDLE]
+        elif s == State.MONITORING:
+            cur = m[State.MONITORING].replace("{mode}", "ON" if self.continuous_mode else "OFF")
+        elif s == State.GENERATING:
+            cur = m[State.GENERATING]
+        elif s == State.WAITING:
+            t = self.target_time.strftime('%H:%M:%S') if self.target_time else '미정'
+            cur = m[State.WAITING].replace("{time}", t)
+        elif s == State.RESUMING:
+            cur = m[State.RESUMING]
+        elif s == State.PAUSED:
+            cur = m[State.PAUSED].replace("{reason}", self._pause_reason)
+        else:
+            cur = str(s)
+        if cur != self.last_status_msg:
+            logging.info(f"💡 [상태 변경] {cur}")
+            self.last_status_msg = cur
+
+    # ── 리소스 확인 ────────────────────────────────────────
+    def _check_resources(self):
+        missing = []
+        if not os.path.exists(resource_path("generating.png")):
+            missing.append("generating.png")
+        if not glob.glob(resource_path("limit_warning*.png")):
+            missing.append("limit_warning*.png")
+        if missing:
+            logging.warning(f"⚠️ 이미지 파일 누락: {', '.join(missing)}")
+
+    # ── 유틸 ───────────────────────────────────────────────
+    def _interruptible_sleep(self, seconds: float):
+        end = time.time() + seconds
+        while self.running and time.time() < end:
+            time.sleep(0.1)
+
+    def get_claude_window(self):
+        if sys.platform != 'win32':
+            return None
+        candidates = []
+        try:
+            for w in gw.getWindowsWithTitle(TARGET_WINDOW_TITLE):
+                title = w.title or ""
+                if title == APP_NAME:
+                    continue
+                if any(bad in title for bad in EXCLUDE_TITLE_KEYWORDS):
+                    continue
+                candidates.append(w)
+        except Exception as e:
+            logging.debug(f"창 검색 오류: {e}")
+        for w in candidates:
+            if w.title == TARGET_WINDOW_TITLE:
+                return w
+        return candidates[0] if candidates else None
+
     @staticmethod
     def _window_region(win):
         if not win:
             return None
         try:
-            left = max(0, win.left)
-            top = max(0, win.top)
-            width = max(1, win.width)
-            height = max(1, win.height)
-            return (left, top, width, height)
+            return (max(0, win.left), max(0, win.top),
+                    max(1, win.width), max(1, win.height))
         except Exception:
             return None
 
     def _grab_window_frame(self, win):
-        """[제안 #1] 창 영역을 1회 캡처해 (PIL 이미지, 원점 left, 원점 top)을 돌려준다.
-        캡처에 실패하면 None을 돌려줘 호출부가 기존 locateOnScreen 경로로 자연스럽게 폴백한다."""
         region = self._window_region(win)
         try:
             if region:
@@ -831,33 +952,32 @@ class ClaudeWorker(QThread):
                 return (pyautogui.screenshot(region=region), left, top)
             return (pyautogui.screenshot(), 0, 0)
         except Exception as e:
-            logging.debug(f"주기 화면 캡처 실패(개별 매칭으로 폴백): {e}")
+            logging.debug(f"주기 화면 캡처 실패(폴백): {e}")
             return None
 
-    # [수정] 흑백(grayscale) 설정 + 주기당 캡처 재사용(frame) 파라미터 추가
     def _locate(self, img_path, win, confidence, use_grayscale=False, frame=None):
         try:
             if frame is not None:
-                # [제안 #1] 이미 캡처해 둔 화면(haystack)에서 needle을 찾고,
-                #           반환 좌표를 창 원점만큼 더해 절대 화면 좌표로 환산한다.
-                shot, origin_x, origin_y = frame
-                box = pyautogui.locate(img_path, shot, confidence=confidence, grayscale=use_grayscale)
+                shot, ox, oy = frame
+                box = pyautogui.locate(img_path, shot,
+                                       confidence=confidence, grayscale=use_grayscale)
                 if box is None:
                     return None
-                return ScreenBox(int(box.left) + origin_x, int(box.top) + origin_y,
+                return ScreenBox(int(box.left) + ox, int(box.top) + oy,
                                  int(box.width), int(box.height))
             region = self._window_region(win)
             if region:
-                return pyautogui.locateOnScreen(img_path, confidence=confidence, region=region, grayscale=use_grayscale)
-            return pyautogui.locateOnScreen(img_path, confidence=confidence, grayscale=use_grayscale)
+                return pyautogui.locateOnScreen(img_path, confidence=confidence,
+                                                region=region, grayscale=use_grayscale)
+            return pyautogui.locateOnScreen(img_path, confidence=confidence,
+                                            grayscale=use_grayscale)
         except Exception:
             return None
 
     def _locate_rate_limit(self, claude_win, frame=None):
-        """한도 초과 이미지가 화면에 있으면 (pos, 파일명), 없으면 (None, None). 부작용 없음."""
         for img_path in glob.glob(resource_path("limit_warning*.png")):
-            # 오탐지를 원천 차단하기 위해 흑백 인식을 끄고(컬러 비교), 신뢰도를 엄격하게(기본 0.9) 둔다.
-            pos = self._locate(img_path, claude_win, confidence=self.limit_confidence,
+            pos = self._locate(img_path, claude_win,
+                               confidence=self.limit_confidence,
                                use_grayscale=False, frame=frame)
             if pos:
                 return pos, os.path.basename(img_path)
@@ -866,48 +986,43 @@ class ClaudeWorker(QThread):
     def _check_for_rate_limit(self, claude_win, frame=None):
         pos, img_name = self._locate_rate_limit(claude_win, frame)
         if pos:
-            logging.info(f"사용량 한도 도달 화면이 감지되었습니다! ({img_name}) OCR로 시간을 판독합니다.")
+            logging.info(f"사용량 한도 도달! ({img_name}) OCR로 시간을 판독합니다.")
             self._setup_wait_timer(claude_win, pos)
             return True
         return False
 
     def _match_any(self, prefix: str, claude_win, base_conf: float, frame=None) -> bool:
-        """resource의 <prefix>*.png 중 하나라도 화면에서 찾으면 True.
-        흑백(base) → 흑백(base-0.10) → 컬러(base-0.08) 순으로 단계적으로 시도해 UI/배율 차이에 견딘다.
-        (base_conf=0.8이면 기존과 동일한 0.8 → 0.70 → 0.72 사다리)"""
         ladder = (
-            (True, base_conf),
-            (True, max(0.40, round(base_conf - 0.10, 2))),
+            (True,  base_conf),
+            (True,  max(0.40, round(base_conf - 0.10, 2))),
             (False, max(0.40, round(base_conf - 0.08, 2))),
         )
         for img_path in glob.glob(resource_path(prefix + "*.png")):
             for use_gray, conf in ladder:
-                if self._locate(img_path, claude_win, conf, use_grayscale=use_gray, frame=frame) is not None:
+                if self._locate(img_path, claude_win, conf,
+                                use_grayscale=use_gray, frame=frame) is not None:
                     return True
         return False
 
     def _check_is_generating(self, claude_win, frame=None):
-        # 생성 중 = 정지 버튼(■, generating*.png) 이 보임
         return self._match_any("generating", claude_win, self.generating_confidence, frame)
 
     def _check_is_ready(self, claude_win, frame=None):
-        # 완료/입력 대기 = 전송 버튼(↵, ready*.png) 이 보임
         return self._match_any("ready", claude_win, self.ready_confidence, frame)
 
     @staticmethod
     def _has_ready_templates() -> bool:
         return bool(glob.glob(resource_path("ready*.png")))
 
+    # ── OCR ────────────────────────────────────────────────
     @staticmethod
     def _ensure_ocr() -> bool:
-        """easyocr Reader를 지연 초기화한다. 사용 가능하면 True, 불가/실패면 False.
-        초기화에 실패하면 HAS_OCR을 꺼 이후 호출이 즉시 False를 반환하게 한다."""
         global HAS_OCR, ocr_reader
         if not HAS_OCR:
             return False
         if ocr_reader is None:
             try:
-                logging.info("OCR 엔진을 초기화하는 중입니다... (최초 1회만 실행되며 약간의 시간이 소요될 수 있습니다)")
+                logging.info("OCR 엔진을 초기화하는 중입니다... (최초 1회)")
                 ocr_reader = easyocr.Reader(['ko', 'en'])
             except Exception as e:
                 logging.error(f"OCR 엔진 초기화 실패: {e}")
@@ -916,24 +1031,20 @@ class ClaudeWorker(QThread):
         return True
 
     def _check_loop_stable(self, claude_win) -> bool:
-        """입력창 바로 위(=응답 마지막 줄) 영역을 OCR해 STABLE_TOKEN이 있으면 True.
-        OCR 불가 시에는 항상 False (자동 정지하지 않음)."""
         if claude_win is None or not self._ensure_ocr():
             return False
         try:
-            # 입력창 클릭 지점(win.bottom - click_y_offset) 위쪽을 넉넉히 캡처
-            # (응답 마지막 줄 위치가 입력창 높이·여백에 따라 달라질 수 있어 띠를 크게 잡음)
             band_h = 420
             bottom = int(claude_win.bottom - self.click_y_offset)
-            top = int(max(0, bottom - band_h))
-            left = int(max(0, claude_win.left + 20))
-            width = int(max(1, claude_win.width - 40))
+            top    = int(max(0, bottom - band_h))
+            left   = int(max(0, claude_win.left + 20))
+            width  = int(max(1, claude_win.width - 40))
             height = int(max(1, bottom - top))
-            screenshot = pyautogui.screenshot(region=(left, top, width, height))
-            results = ocr_reader.readtext(np.array(screenshot))
-            raw = " ".join(t for _bbox, t, _p in results)
-            # OCR 오인식 보정: 공백 제거, 대문자화, 0↔O 치환 후 알파벳만 남겨 비교
-            normalized = re.sub(r'[^A-Z]', '', "".join(raw.split()).upper().replace("0", "O"))
+            shot   = pyautogui.screenshot(region=(left, top, width, height))
+            results = ocr_reader.readtext(np.array(shot))
+            raw = " ".join(t for _, t, _ in results)
+            normalized = re.sub(r'[^A-Z]', '',
+                                 "".join(raw.split()).upper().replace("0", "O"))
             found = STABLE_TOKEN in normalized
             logging.info(f"🔍 [안정 OCR] '{raw.strip()[:120]}' → {'감지' if found else '미감지'}")
             return found
@@ -941,89 +1052,115 @@ class ClaudeWorker(QThread):
             logging.debug(f"안정 토큰 OCR 실패: {e}")
             return False
 
+    def _check_token_ocr(self, claude_win, token: str) -> bool:
+        """응답 하단 띠를 OCR해 token(예: [STEP1_DONE])이 있으면 True."""
+        if claude_win is None or not self._ensure_ocr():
+            return False
+        try:
+            band_h = 420
+            bottom = int(claude_win.bottom - self.click_y_offset)
+            top    = int(max(0, bottom - band_h))
+            left   = int(max(0, claude_win.left + 20))
+            width  = int(max(1, claude_win.width - 40))
+            height = int(max(1, bottom - top))
+            shot   = pyautogui.screenshot(region=(left, top, width, height))
+            results = ocr_reader.readtext(np.array(shot))
+            raw = " ".join(t for _, t, _ in results)
+            raw_norm = re.sub(r'[^A-Z0-9_\[\]]', '', raw.upper())
+            tok_norm = re.sub(r'[^A-Z0-9_\[\]]', '', token.upper())
+            found = tok_norm in raw_norm
+            logging.info(f"🔍 [스텝 OCR] '{raw.strip()[:80]}' → {'감지' if found else '미감지'} ({token})")
+            return found
+        except Exception as e:
+            logging.debug(f"스텝 완료 OCR 실패: {e}")
+            return False
+
+    # ── 스텝 모드 핵심 ─────────────────────────────────────
+    def _check_step_complete(self, claude_win, frame=None) -> bool:
+        """현재 expected_step의 완료를 감지한다.
+        step{N}_complete*.png 가 있으면 템플릿 매칭, 없으면 OCR 폴백."""
+        n      = self.expected_step
+        prefix = f"step{n}_complete"
+        if glob.glob(resource_path(f"{prefix}*.png")):
+            return self._match_any(prefix, claude_win, self.generating_confidence, frame)
+        # OCR 폴백: [STEP{N}_DONE] 토큰 검사
+        return self._check_token_ocr(claude_win, f"[STEP{n}_DONE]")
+
+    def _build_step_prompt(self, step_idx: int) -> str:
+        """스텝 프롬프트 끝에 완료 토큰 지시어를 자동 합성한다 (step_idx: 0-based)."""
+        n    = step_idx + 1
+        base = self.steps[step_idx].strip()
+        suffix = (
+            f"\n\n---\n"
+            f"[필수] 위 내용을 완전히 완료한 뒤, 응답의 **맨 마지막 줄**에 아래 토큰만 "
+            f"단독으로 출력하라. 다른 텍스트 없이 정확히 이 형태여야 한다.\n"
+            f"[STEP{n}_DONE]"
+        )
+        return base + suffix
+
+    # ── 알림 ───────────────────────────────────────────────
     def _notify_stable(self, claude_win):
-        """정지 시 Claude 창을 캡처해 텔레그램으로 보낸다 (설정 있을 때만).
-        [제안 #4] 캡처 이미지에 더해, 거기서 OCR로 추출한 '백로그 텍스트'도 함께 동봉해
-        모바일에서 이미지를 확대하지 않고도 백로그 내용을 바로 읽을 수 있게 한다."""
-        # 텔레그램이 설정되지 않았으면 캡처/OCR 비용을 들이지 않고 즉시 종료한다.
         if not load_telegram_config():
             return
         try:
-            region = self._window_region(claude_win)
-            shot = pyautogui.screenshot(region=region) if region else pyautogui.screenshot()
-            tmp_path = os.path.join(tempfile.gettempdir(), "autopilot_stable.png")
-            shot.save(tmp_path)
+            region  = self._window_region(claude_win)
+            shot    = pyautogui.screenshot(region=region) if region else pyautogui.screenshot()
+            tmp     = os.path.join(tempfile.gettempdir(), "autopilot_stable.png")
+            shot.save(tmp)
             caption = f"[Auto-Pilot] 계획 안정 — 정지됨 ({datetime.datetime.now():%Y-%m-%d %H:%M})"
-            send_telegram_photo(tmp_path, caption)
-            # 같은 캡처를 재사용해 백로그 텍스트를 뽑아 별도 메시지로 동봉(캡션 1024자 제한 회피).
-            backlog_text = self._extract_backlog_text(shot)
-            if backlog_text:
-                send_telegram_text("[Auto-Pilot] 📋 백로그\n" + backlog_text[:3500])
+            send_telegram_photo(tmp, caption)
+            backlog = self._extract_backlog_text(shot)
+            if backlog:
+                send_telegram_text("[Auto-Pilot] 📋 백로그\n" + backlog[:3500])
         except Exception as e:
             logging.error(f"정지 알림 처리 실패: {e}")
 
+    def _notify_all_done(self, claude_win):
+        """모든 스텝 완료 시 텔레그램 알림."""
+        self._notify_stable(claude_win)   # 같은 캡처+텍스트 패턴 재사용
+        logging.info("📨 모든 스텝 완료 알림을 전송했습니다.")
+
     def _extract_backlog_text(self, screenshot) -> str:
-        """[제안 #4] 정지 캡처 이미지에서 백로그로 보이는 텍스트를 OCR로 추출한다.
-        OCR 불가/실패 시 빈 문자열을 돌려줘 알림은 이미지만 전송된다(기존 동작 유지)."""
         if screenshot is None or not self._ensure_ocr():
             return ""
         try:
             results = ocr_reader.readtext(np.array(screenshot))
-            lines = [t.strip() for _bbox, t, _p in results if t and t.strip()]
+            lines   = [t.strip() for _, t, _ in results if t and t.strip()]
             return "\n".join(lines).strip()
         except Exception as e:
             logging.debug(f"백로그 OCR 실패: {e}")
             return ""
 
+    # ── 한도 대기 타이머 ────────────────────────────────────
     def _setup_wait_timer(self, claude_win, limit_pos):
-        # OCR을 쓸 수 없으면(미설치/초기화 실패) 시간 판독을 포기하고 안전 대기 시간을 적용한다.
         if not self._ensure_ocr():
-            logging.error("easyocr를 사용할 수 없어 OCR 시간 판독을 건너뜁니다. (필요 시: pip install easyocr numpy)")
-            logging.info(f"안전 대기 시간({FALLBACK_WAIT_MINUTES}분) 적용...")
+            logging.error("easyocr 없음 — 안전 대기 시간 적용 (pip install easyocr numpy)")
             self.target_time = datetime.datetime.now() + datetime.timedelta(minutes=FALLBACK_WAIT_MINUTES)
             self.state = State.WAITING
             return
-
-        # [변경] 마우스 클릭/클립보드 복사를 완전히 제거하고 화면 캡처 OCR로 교체
-        # limit_pos(한도초과 아이콘 위치)를 기준으로 우측으로 500px, 상하로 약간 여유를 두고 캡처 영역 설정
-        left = int(limit_pos.left)
-        top = int(max(0, limit_pos.top - 15))
-        width = int(limit_pos.width + 500)
+        left   = int(limit_pos.left)
+        top    = int(max(0, limit_pos.top - 15))
+        width  = int(limit_pos.width + 500)
         height = int(limit_pos.height + 30)
-        capture_region = (left, top, width, height)
-
         logging.info("OCR을 위해 알림 텍스트 영역을 캡처합니다...")
-
         try:
-            # 1. 화면 캡처 및 numpy 배열 변환
-            screenshot = pyautogui.screenshot(region=capture_region)
-            img_np = np.array(screenshot)
-            
-            # 2. 이미지에서 텍스트 추출
-            results = ocr_reader.readtext(img_np)
-            
-            # 3. 추출된 텍스트 조립 (인식된 글자 덩어리들을 띄어쓰기로 연결)
-            copied_text = " ".join([text for bbox, text, prob in results])
-                
-            debug_text = copied_text.replace('\n', ' ').strip()
-            logging.info(f"🔍 [OCR 결과]: {debug_text if debug_text else '텍스트를 찾지 못함'}")
-            
-            # 4. 시간 파싱
-            parsed_time = parse_target_time(copied_text)
-
+            shot    = pyautogui.screenshot(region=(left, top, width, height))
+            results = ocr_reader.readtext(np.array(shot))
+            text    = " ".join(t for _, t, _ in results)
+            logging.info(f"🔍 [OCR 결과]: {text.replace(chr(10),' ').strip()[:200]}")
+            parsed  = parse_target_time(text)
         except Exception as e:
             logging.error(f"OCR 실행 실패: {e}")
-            parsed_time = None
-
-        if parsed_time:
-            self.target_time = parsed_time
-            logging.info(f"OCR 분석으로 재개 시간을 파악했습니다: {self.target_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            parsed = None
+        if parsed:
+            self.target_time = parsed
+            logging.info(f"재개 시각: {self.target_time:%Y-%m-%d %H:%M:%S}")
         else:
             self.target_time = datetime.datetime.now() + datetime.timedelta(minutes=FALLBACK_WAIT_MINUTES)
-            logging.info(f"시간 파싱 실패. 안전 대기 시간({FALLBACK_WAIT_MINUTES}분) 적용: {self.target_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            
+            logging.info(f"시간 파싱 실패 → 안전 대기({FALLBACK_WAIT_MINUTES}분): {self.target_time:%H:%M:%S}")
         self.state = State.WAITING
 
+    # ── 포커스 및 입력 ─────────────────────────────────────
     def _focus_claude_window(self):
         win = self.get_claude_window()
         if win:
@@ -1031,7 +1168,6 @@ class ClaudeWorker(QThread):
                 if win.isMinimized:
                     win.restore()
                 win.activate()
-                # 윈도우가 완전히 활성화될 때까지 약간 대기
                 time.sleep(0.2)
             except Exception as e:
                 logging.error(f"클로드 창 활성화 실패: {e}")
@@ -1048,290 +1184,267 @@ class ClaudeWorker(QThread):
         self._interruptible_sleep(3.0)
         if not self.running:
             return
-            
-        # 슬립 직후 사용자가 다른 창을 띄웠는지 재검증
-        if win.title != gw.getActiveWindow().title:
-            logging.warning("사용자 개입 감지: 클로드 창이 포커스를 잃어 자동 전송을 보류합니다.")
-            return
+
+        try:
+            active_win = gw.getActiveWindow()
+            if active_win and win.title != active_win.title:
+                logging.warning("사용자 개입 감지 — 자동 전송을 보류합니다.")
+                return
+        except Exception:
+            pass
+
+        # 스텝 모드인 경우 전송할 텍스트를 미리 결정
+        step_prompt: str | None = None
+        if self.steps and self.continuous_mode:
+            step_idx = self.expected_step - 1
+            if self.continue_count > 0:
+                step_prompt = "계속 이어서 작성해 줘"
+            elif 0 <= step_idx < len(self.steps):
+                step_prompt = self._build_step_prompt(step_idx)
+            else:
+                logging.error(f"유효하지 않은 스텝 인덱스({step_idx}) — 전송 중단")
+                return
 
         original_clipboard = safe_clipboard_paste()
         try:
             pyperclip.copy("")
-
             center_x = win.left + (win.width // 2)
             bottom_y = win.bottom - self.click_y_offset
             pyautogui.click(x=center_x, y=bottom_y)
             time.sleep(0.5)
 
-            pyautogui.hotkey('ctrl', 'a')
-            time.sleep(0.2)
-            pyautogui.hotkey('ctrl', 'c')
-            time.sleep(0.5)
-
-            current_input = safe_clipboard_paste().strip()
-
-            if len(current_input) > MAX_INPUT_LEN:
-                logging.warning(
-                    f"입력창에서 비정상적으로 긴 텍스트({len(current_input)}자)가 감지되었습니다. "
-                    "입력창이 아닌 대화 영역을 클릭했을 가능성이 있어 전송을 건너뜁니다. "
-                    "위치 테스트로 Y 오프셋을 점검하세요."
-                )
-            elif current_input:
-                logging.info("입력창에 텍스트가 있습니다. 기존 메시지를 전송합니다.")
-                pyautogui.press('right')
+            if step_prompt is not None:
+                # 스텝 모드: 항상 전송할 내용이 정해져 있으므로 입력창을 지우고 붙여넣기
+                pyautogui.hotkey('ctrl', 'a')
                 time.sleep(0.2)
-                pyautogui.press('enter')
-            else:
-                logging.info("입력창이 비어있습니다. 스마트 프롬프트를 전송합니다.")
-                pyperclip.copy(self.smart_prompt)
+                pyperclip.copy(step_prompt)
                 time.sleep(0.2)
                 pyautogui.hotkey('ctrl', 'v')
                 time.sleep(0.5)
                 pyautogui.press('enter')
                 time.sleep(1)
+            else:
+                # 클래식 모드: 기존 입력창 내용 확인 후 전송 or 스마트 프롬프트
+                pyautogui.hotkey('ctrl', 'a')
+                time.sleep(0.2)
+                pyautogui.hotkey('ctrl', 'c')
+                time.sleep(0.5)
+                current_input = safe_clipboard_paste().strip()
+                if len(current_input) > MAX_INPUT_LEN:
+                    logging.warning(f"입력창 비정상({len(current_input)}자) — 전송 건너뜀. Y오프셋을 점검하세요.")
+                elif current_input:
+                    logging.info("입력창에 텍스트가 있습니다. 기존 메시지를 전송합니다.")
+                    pyautogui.press('right')
+                    time.sleep(0.2)
+                    pyautogui.press('enter')
+                else:
+                    logging.info("입력창이 비어있습니다. 스마트 프롬프트를 전송합니다.")
+                    pyperclip.copy(self.smart_prompt)
+                    time.sleep(0.2)
+                    pyautogui.hotkey('ctrl', 'v')
+                    time.sleep(0.5)
+                    pyautogui.press('enter')
+                    time.sleep(1)
         finally:
             try:
-                if original_clipboard:
-                    pyperclip.copy(original_clipboard)
-                else:
-                    pyperclip.copy("")
+                pyperclip.copy(original_clipboard if original_clipboard else "")
             except Exception as e:
                 logging.debug(f"클립보드 복구 실패: {e}")
 
         self._interruptible_sleep(5.0)
 
 # ---------------------------------------------------------
-# 6. 메인 GUI 창 (Main Window)
+# 13. 메인 GUI 창
 # ---------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{VERSION}")
         self.setWindowIcon(app_icon())
-        # UI 요소들이 넉넉하게 배치되도록 높이를 약간 더 늘림
-        self.resize(850, 520)
-        self.tray = None
+        self.resize(880, 680)
+        self.tray        = None
         self._force_quit = False
+        self._tg_poller: TelegramPollerThread | None = None
+        self._step_items: list[StepItemWidget] = []
 
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setSpacing(12)  # 위젯 간 간격 넓힘
-        main_layout.setContentsMargins(15, 15, 15, 15)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setSpacing(8)
+        root.setContentsMargins(12, 12, 12, 12)
 
-        # 1. 상단 툴바 (체크박스 및 환경설정/로그지우기)
+        # ── 상단 툴바 ─────────────────────────────────────
         top_bar = QHBoxLayout()
-        
-        # 1-1. 좌측 토글 스위치 그룹
-        toggle_layout = QHBoxLayout()
         self.cb_continuous = QCheckBox("연속 작업 모드 (ON/OFF)")
         self.cb_continuous.setFont(QFont("Malgun Gothic", 10, QFont.Weight.Bold))
         self.cb_continuous.stateChanged.connect(self.toggle_continuous_mode)
-        toggle_layout.addWidget(self.cb_continuous)
+        top_bar.addWidget(self.cb_continuous)
 
         self.cb_always_on_top = QCheckBox("📌 항상 위 고정")
         self.cb_always_on_top.setFont(QFont("Malgun Gothic", 10, QFont.Weight.Bold))
         self.cb_always_on_top.stateChanged.connect(self.toggle_always_on_top)
-        self.cb_always_on_top.setChecked(False)  # 시작 시 항상 위 고정 해제
-        toggle_layout.addWidget(self.cb_always_on_top)
-        
-        top_bar.addLayout(toggle_layout)
-        top_bar.addStretch() # 가운데 여백으로 양쪽 정렬
-        
-        # 1-2. 우측 도구 버튼 그룹
-        tool_layout = QHBoxLayout()
-        self.btn_settings = QPushButton("⚙️ 환경 설정")
-        self.btn_settings.setStyleSheet("""
-            QPushButton {
-                background-color: #34495e; color: white; font-weight: bold; 
-                padding: 6px 12px; border-radius: 4px;
-            }
-            QPushButton:hover { background-color: #2c3e50; }
-        """)
-        self.btn_settings.clicked.connect(self.open_settings)
-        tool_layout.addWidget(self.btn_settings)
+        top_bar.addWidget(self.cb_always_on_top)
 
-        self.btn_clear = QPushButton("🗑️ 로그 지우기")
-        self.btn_clear.setStyleSheet("""
-            QPushButton {
-                background-color: #7f8c8d; color: white; font-weight: bold;
-                padding: 6px 12px; border-radius: 4px;
-            }
-            QPushButton:hover { background-color: #95a5a6; }
-        """)
-        self.btn_clear.clicked.connect(self.clear_logs)
-        tool_layout.addWidget(self.btn_clear)
+        top_bar.addStretch()
+        for label, slot in [
+            ("⚙️ 환경 설정", self.open_settings),
+            ("🗑️ 로그 지우기", self.clear_logs),
+            ("📨 텔레그램", self.open_telegram_settings),
+        ]:
+            btn = QPushButton(label)
+            btn.setStyleSheet(
+                "QPushButton { background-color:#34495e; color:white; font-weight:bold;"
+                " padding:5px 10px; border-radius:4px; }"
+                "QPushButton:hover { background-color:#2c3e50; }"
+            )
+            btn.clicked.connect(slot)
+            top_bar.addWidget(btn)
+        root.addLayout(top_bar)
 
-        self.btn_telegram = QPushButton("📨 텔레그램")
-        self.btn_telegram.setStyleSheet("""
-            QPushButton {
-                background-color: #2a7ab0; color: white; font-weight: bold;
-                padding: 6px 12px; border-radius: 4px;
-            }
-            QPushButton:hover { background-color: #3498db; }
-        """)
-        self.btn_telegram.clicked.connect(self.open_telegram_settings)
-        tool_layout.addWidget(self.btn_telegram)
-
-        top_bar.addLayout(tool_layout)
-        main_layout.addLayout(top_bar)
-
-        # 2. 오프셋 설정 및 테스트 그룹 (시각적 분리를 위해 얇은 박스 처리)
+        # ── Y오프셋 + 위치 테스트 ─────────────────────────
         offset_frame = QWidget()
-        offset_frame.setStyleSheet("""
-            QWidget {
-                background-color: rgba(100, 100, 100, 0.1);
-                border-radius: 6px;
-            }
-        """)
-        offset_layout = QHBoxLayout(offset_frame)
-        offset_layout.setContentsMargins(10, 8, 10, 8)
-        
-        lbl_offset = QLabel("📍 입력창 Y좌표 오프셋 (창 하단기준):")
-        lbl_offset.setStyleSheet("background: transparent; font-weight: bold;")
-        offset_layout.addWidget(lbl_offset)
-        
+        offset_frame.setStyleSheet(
+            "QWidget { background-color:rgba(100,100,100,0.1); border-radius:6px; }"
+        )
+        ofl = QHBoxLayout(offset_frame)
+        ofl.setContentsMargins(10, 6, 10, 6)
+        lbl = QLabel("📍 입력창 Y오프셋 (창 하단기준):")
+        lbl.setStyleSheet("background:transparent; font-weight:bold;")
+        ofl.addWidget(lbl)
         self.spin_offset = QSpinBox()
         self.spin_offset.setRange(10, 800)
         self.spin_offset.setValue(110)
         self.spin_offset.setSuffix(" px")
-        self.spin_offset.setStyleSheet("""
-            QSpinBox {
-                background-color: #2c3e50;
-                color: #ffffff;
-                border: 1px solid #34495e;
-                border-radius: 4px;
-                padding: 3px 8px;
-                font-size: 10pt;
-                font-weight: bold;
-                min-height: 20px;
-            }
-            /* 포커스 되었을 때의 테두리를 튀지 않는 차분한 톤으로 수정 */
-            QSpinBox:focus {
-                border: 1px solid #5d6d7e;
-                background-color: #1a252f;
-            }
-            QSpinBox::up-button {
-                subcontrol-origin: border;
-                subcontrol-position: top right;
-                width: 16px;
-                border-left: 1px solid #34495e;
-                border-top-right-radius: 3px;
-                background-color: #2c3e50;
-            }
-            QSpinBox::down-button {
-                subcontrol-origin: border;
-                subcontrol-position: bottom right;
-                width: 16px;
-                border-left: 1px solid #34495e;
-                border-bottom-right-radius: 3px;
-                background-color: #2c3e50;
-            }
-            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
-                background-color: #34495e;
-            }
-            QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {
-                background-color: #1a252f;
-            }
-        """)
+        self.spin_offset.setStyleSheet(
+            "QSpinBox { background:#2c3e50; color:#fff; border:1px solid #34495e;"
+            " border-radius:4px; padding:3px 8px; font-size:10pt; font-weight:bold; min-height:20px; }"
+        )
         self.spin_offset.valueChanged.connect(self.update_offset)
-        offset_layout.addWidget(self.spin_offset)
-        
-        self.btn_test = QPushButton("🎯 위치 테스트")
-        # [수정] 테스트 버튼의 배경색을 QSpinBox와 동일한 남색(#2c3e50)으로 통일
-        self.btn_test.setStyleSheet("""
-            QPushButton {
-                background-color: #2c3e50; color: white; font-weight: bold; 
-                font-size: 10pt; padding: 4px 12px; border-radius: 4px; border: none;
-                min-height: 20px;
-            }
-            QPushButton:hover { background-color: #34495e; }
-        """)
-        self.btn_test.clicked.connect(self.test_click_position)
-        offset_layout.addWidget(self.btn_test)
-        offset_layout.addStretch()
-        
-        main_layout.addWidget(offset_frame)
+        ofl.addWidget(self.spin_offset)
+        btn_test = QPushButton("🎯 위치 테스트")
+        btn_test.setStyleSheet(
+            "QPushButton { background:#2c3e50; color:white; font-weight:bold;"
+            " padding:4px 12px; border-radius:4px; }"
+            "QPushButton:hover { background:#34495e; }"
+        )
+        btn_test.clicked.connect(self.test_click_position)
+        ofl.addWidget(btn_test)
+        ofl.addStretch()
+        root.addWidget(offset_frame)
 
-        # 3. 로그 콘솔 영역
+        # ── 스텝 관리 영역 ────────────────────────────────
+        step_group = QGroupBox("📋 스텝 관리 (비워두면 클래식 모드)")
+        step_group.setStyleSheet(
+            "QGroupBox { font-weight:bold; font-size:10pt; }"
+        )
+        sg_layout = QVBoxLayout(step_group)
+        sg_layout.setSpacing(4)
+
+        # 스크롤 영역
+        self._step_scroll = QScrollArea()
+        self._step_scroll.setWidgetResizable(True)
+        self._step_scroll.setFixedHeight(200)
+        self._step_scroll.setStyleSheet(
+            "QScrollArea { border:1px solid #3c3c3c; background:#1a1a1a; }"
+        )
+        self._step_container = QWidget()
+        self._step_layout    = QVBoxLayout(self._step_container)
+        self._step_layout.setSpacing(4)
+        self._step_layout.addStretch()
+        self._step_scroll.setWidget(self._step_container)
+        sg_layout.addWidget(self._step_scroll)
+
+        # 하단 컨트롤
+        step_ctrl = QHBoxLayout()
+        self.btn_add_step = QPushButton("+ 스텝 추가")
+        self.btn_add_step.setStyleSheet(
+            "QPushButton { background:#27ae60; color:white; font-weight:bold;"
+            " padding:4px 14px; border-radius:4px; }"
+            "QPushButton:hover { background:#2ecc71; }"
+        )
+        self.btn_add_step.clicked.connect(self.add_step)
+        step_ctrl.addWidget(self.btn_add_step)
+
+        self.lbl_progress = QLabel("스텝 없음 — 클래식 모드로 실행됩니다.")
+        self.lbl_progress.setStyleSheet("color:#888; font-size:9pt;")
+        step_ctrl.addWidget(self.lbl_progress)
+        step_ctrl.addStretch()
+        sg_layout.addLayout(step_ctrl)
+        root.addWidget(step_group)
+
+        # ── 로그 콘솔 ─────────────────────────────────────
         self.log_console = QPlainTextEdit()
         self.log_console.setReadOnly(True)
-        # 로그 콘솔 내 텍스트 자동 줄바꿈 방지 (가로 스크롤바 생성)
         self.log_console.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.log_console.setStyleSheet("""
-            QPlainTextEdit {
-                background-color: #1E1E1E;
-                color: #D4D4D4;
-                font-family: Consolas, monospace;
-                font-size: 10pt;
-                padding: 10px;
-                border: 2px solid #2c3e50;
-                border-radius: 6px;
-            }
-        """)
-        main_layout.addWidget(self.log_console)
+        self.log_console.setStyleSheet(
+            "QPlainTextEdit { background:#1E1E1E; color:#D4D4D4;"
+            " font-family:Consolas,monospace; font-size:10pt; padding:8px;"
+            " border:2px solid #2c3e50; border-radius:6px; }"
+        )
+        root.addWidget(self.log_console, stretch=1)
 
-        # 4. 하단 핵심 액션 버튼 (크고 눈에 띄게)
+        # ── 액션 버튼 ─────────────────────────────────────
         action_bar = QHBoxLayout()
-        action_bar.setSpacing(15)
-        
+        action_bar.setSpacing(10)
+
         self.btn_start = QPushButton("▶ 감시 시작")
-        self.btn_start.setStyleSheet("""
-            QPushButton {
-                background-color: #2ecc71; color: white; font-weight: bold; 
-                font-size: 13pt; padding: 12px; border-radius: 6px;
-            }
-            QPushButton:hover { background-color: #27ae60; }
-            QPushButton:disabled { background-color: #95a5a6; }
-        """)
+        self.btn_start.setStyleSheet(
+            "QPushButton { background:#2ecc71; color:white; font-weight:bold;"
+            " font-size:12pt; padding:10px; border-radius:6px; }"
+            "QPushButton:hover { background:#27ae60; }"
+            "QPushButton:disabled { background:#95a5a6; }"
+        )
         self.btn_start.clicked.connect(self.start_worker)
         action_bar.addWidget(self.btn_start)
 
         self.btn_stop = QPushButton("■ 감시 중지")
-        self.btn_stop.setStyleSheet("""
-            QPushButton {
-                background-color: #e74c3c; color: white; font-weight: bold; 
-                font-size: 13pt; padding: 12px; border-radius: 6px;
-            }
-            QPushButton:hover { background-color: #c0392b; }
-            QPushButton:disabled { background-color: #95a5a6; }
-        """)
+        self.btn_stop.setStyleSheet(
+            "QPushButton { background:#e74c3c; color:white; font-weight:bold;"
+            " font-size:12pt; padding:10px; border-radius:6px; }"
+            "QPushButton:hover { background:#c0392b; }"
+            "QPushButton:disabled { background:#95a5a6; }"
+        )
         self.btn_stop.clicked.connect(self.stop_worker)
         self.btn_stop.setEnabled(False)
         action_bar.addWidget(self.btn_stop)
 
-        main_layout.addLayout(action_bar)
+        self.btn_force_next = QPushButton("⏭ 강제 다음 스텝")
+        self.btn_force_next.setStyleSheet(
+            "QPushButton { background:#8e44ad; color:white; font-weight:bold;"
+            " font-size:12pt; padding:10px; border-radius:6px; }"
+            "QPushButton:hover { background:#9b59b6; }"
+            "QPushButton:disabled { background:#95a5a6; }"
+        )
+        self.btn_force_next.clicked.connect(self._on_force_next)
+        self.btn_force_next.setEnabled(False)
+        action_bar.addWidget(self.btn_force_next)
 
+        root.addLayout(action_bar)
+
+        # ── 워커 및 로깅 연결 ─────────────────────────────
         self.worker = ClaudeWorker()
         self.worker.toast_signal.connect(self.show_toast)
         self.worker.continuous_mode_changed.connect(self._sync_continuous_checkbox)
+        self.worker.step_progress_signal.connect(self._on_step_progress)
+        self.worker.auto_paused_signal.connect(self._on_auto_paused)
         self.setup_logging()
         self.setup_tray()
 
-        # 창 시작 위치: 우측 하단 (작업표시줄 바로 위)
         screen_geom = QApplication.primaryScreen().availableGeometry()
-        # 윈도우 제목 표시줄 두께(약 30~40px)를 고려하여 Y좌표 여백을 50px로 넉넉하게 수정
-        x = screen_geom.right() - self.width() - 10
-        y = screen_geom.bottom() - self.height() - 50
-        self.move(x, y)
+        self.move(screen_geom.right() - self.width() - 10,
+                  screen_geom.bottom() - self.height() - 50)
 
+    # ── 트레이 ────────────────────────────────────────────
     def setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
-            self.tray = None
             return
-
         self.tray = QSystemTrayIcon(app_icon(), self)
         self.tray.setToolTip(APP_NAME)
-
         menu = QMenu()
-        act_show = menu.addAction("창 보이기")
-        act_show.triggered.connect(self.show_normal_from_tray)
-        act_hide = menu.addAction("창 숨기기")
-        act_hide.triggered.connect(self.hide)
+        menu.addAction("창 보이기").triggered.connect(self.show_normal_from_tray)
+        menu.addAction("창 숨기기").triggered.connect(self.hide)
         menu.addSeparator()
-        act_quit = menu.addAction("종료")
-        act_quit.triggered.connect(self.quit_from_tray)
-
+        menu.addAction("종료").triggered.connect(self.quit_from_tray)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self.on_tray_activated)
         self.tray.show()
@@ -1349,116 +1462,299 @@ class MainWindow(QMainWindow):
         self._force_quit = True
         self.close()
 
-    def update_offset(self, value):
-        self.worker.click_y_offset = value
-        logging.info(f"클릭 위치 오프셋이 {value}px 로 변경되었습니다.")
+    # ── 스텝 관리 ─────────────────────────────────────────
+    def add_step(self, text: str = ""):
+        idx    = len(self._step_items) + 1
+        item   = StepItemWidget(idx, text, self._step_container)
+        item.delete_requested.connect(self._remove_step)
+        # stretch 앞에 삽입
+        count = self._step_layout.count()
+        self._step_layout.insertWidget(count - 1, item)
+        self._step_items.append(item)
+        self._update_step_labels()
+        self._update_progress_label()
 
+    def _remove_step(self, item: StepItemWidget):
+        if item in self._step_items:
+            self._step_items.remove(item)
+            self._step_layout.removeWidget(item)
+            item.deleteLater()
+            self._update_step_labels()
+            self._update_progress_label()
+
+    def _update_step_labels(self):
+        for i, item in enumerate(self._step_items, start=1):
+            item.set_index(i)
+
+    def _update_progress_label(self, current: int = 0):
+        total = len(self._step_items)
+        if total == 0:
+            self.lbl_progress.setText("스텝 없음 — 클래식 모드로 실행됩니다.")
+        elif current == 0:
+            self.lbl_progress.setText(f"총 {total}개 스텝 등록됨. 시작하면 Step 1부터 진행합니다.")
+        else:
+            self.lbl_progress.setText(f"▶ Step {current}/{total} 진행 중")
+
+    def get_steps(self) -> list[str]:
+        return [item.get_text().strip()
+                for item in self._step_items
+                if item.get_text().strip()]
+
+    def _lock_ui(self, locked: bool):
+        self.btn_add_step.setEnabled(not locked)
+        for item in self._step_items:
+            item.set_locked(locked)
+
+    # ── 신호 핸들러 ───────────────────────────────────────
+    def _on_step_progress(self, current: int, total: int):
+        self._update_progress_label(current)
+        for i, item in enumerate(self._step_items, start=1):
+            item.set_active(i == current, done=(i < current))
+
+    def _on_auto_paused(self, reason: str):
+        logging.warning(f"⚠️ 자동 일시 정지: {reason}")
+        self.btn_force_next.setEnabled(True)
+        if self.tray:
+            self.tray.showMessage(
+                APP_NAME, f"자동 정지: {reason}",
+                QSystemTrayIcon.MessageIcon.Warning, 5000,
+            )
+
+    def _on_force_next(self):
+        self.worker.force_next_step()
+        self.btn_force_next.setEnabled(False)
+
+    def _sync_continuous_checkbox(self, on: bool):
+        self.cb_continuous.blockSignals(True)
+        self.cb_continuous.setChecked(on)
+        self.cb_continuous.blockSignals(False)
+
+    # ── 텔레그램 명령 처리 ────────────────────────────────
+    def _on_telegram_command(self, cmd: str):
+        cfg = load_telegram_config()
+        token = cfg["bot_token"] if cfg else ""
+        chat  = cfg["chat_id"]   if cfg else ""
+
+        def reply(text: str):
+            if token and chat:
+                send_telegram_message(token, chat, text)
+
+        cmd = cmd.lower()
+        if cmd == "/status":
+            steps_info = (f"스텝 {self.worker.expected_step}/{len(self.worker.steps)}"
+                          if self.worker.steps else "클래식 모드")
+            reply(f"[Auto-Pilot] 상태: {self.worker.state.value} | {steps_info}"
+                  f" | 연속모드: {'ON' if self.worker.continuous_mode else 'OFF'}")
+        elif cmd == "/stop":
+            QTimer.singleShot(0, self.stop_worker)
+            reply("[Auto-Pilot] 감시를 중지합니다.")
+        elif cmd == "/pause":
+            self.worker.continuous_mode = False
+            self._sync_continuous_checkbox(False)
+            reply("[Auto-Pilot] 연속 모드를 OFF했습니다.")
+        elif cmd == "/resume":
+            self.worker.continuous_mode = True
+            self._sync_continuous_checkbox(True)
+            if self.worker.state == State.PAUSED:
+                self.worker.state = State.RESUMING
+            reply("[Auto-Pilot] 연속 모드를 ON했습니다.")
+        elif cmd == "/next":
+            QTimer.singleShot(0, self._on_force_next)
+            reply(f"[Auto-Pilot] 강제 다음 스텝 → {self.worker.expected_step + 1}")
+        else:
+            reply(f"[Auto-Pilot] 알 수 없는 명령: {cmd}\n"
+                  f"사용 가능: /status /stop /pause /resume /next")
+        logging.info(f"📨 텔레그램 명령 수신: {cmd}")
+
+    # ── 감시 시작/중지 ────────────────────────────────────
+    def start_worker(self):
+        if self.worker.isRunning():
+            return
+
+        steps = self.get_steps()
+
+        # 사전 검증
+        if steps:
+            no_detection = []
+            for i in range(1, len(steps) + 1):
+                has_img = bool(glob.glob(resource_path(f"step{i}_complete*.png")))
+                if not has_img and not HAS_OCR:
+                    no_detection.append(i)
+            if no_detection:
+                nums = ", ".join(str(n) for n in no_detection)
+                QMessageBox.critical(
+                    self, "사전 검증 실패",
+                    f"스텝 {nums}번: 완료 감지 이미지(step{{N}}_complete*.png)도 없고\n"
+                    f"OCR(easyocr)도 설치되지 않아 완료를 감지할 수 없습니다.\n\n"
+                    f"• resource 폴더에 이미지를 추가하거나\n"
+                    f"• pip install easyocr numpy 를 실행하세요."
+                )
+                return
+            if not HAS_OCR:
+                logging.warning("⚠️ easyocr 없음 — 스텝 완료 감지는 이미지 매칭으로만 동작합니다.")
+
+        # 워커 초기화
+        self.worker.steps         = steps
+        self.worker.expected_step = 1
+        self.worker.continue_count = 0
+
+        # F12 전역 긴급 정지 등록
+        if HAS_KEYBOARD:
+            try:
+                _keyboard_lib.add_hotkey('f12', self._emergency_stop_hotkey)
+                logging.info("⌨️ F12 전역 긴급 정지 등록됨.")
+            except Exception as e:
+                logging.warning(f"F12 단축키 등록 실패: {e}")
+
+        # 텔레그램 양방향 폴러 시작
+        self._start_tg_poller()
+
+        self._lock_ui(True)
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self._update_progress_label(1 if steps else 0)
+        self.worker.start()
+
+    def stop_worker(self):
+        if HAS_KEYBOARD:
+            try:
+                _keyboard_lib.remove_hotkey('f12')
+            except Exception:
+                pass
+        self._stop_tg_poller()
+        self.worker.stop()
+        self.worker.wait()
+        self._lock_ui(False)
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.btn_force_next.setEnabled(False)
+        for item in self._step_items:
+            item.set_active(False)
+        self._update_progress_label()
+        logging.info("감시가 중지되었습니다.")
+
+    def _emergency_stop_hotkey(self):
+        """keyboard 라이브러리 콜백 — 워커 스레드에서 호출되므로 Qt 작업은 메인으로 마샬."""
+        self.worker.stop()
+        QTimer.singleShot(0, self._after_emergency_stop)
+
+    def _after_emergency_stop(self):
+        self.worker.wait()
+        self._lock_ui(False)
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.btn_force_next.setEnabled(False)
+        logging.warning("🚨 F12 긴급 정지!")
+
+    # ── 텔레그램 폴러 관리 ────────────────────────────────
+    def _start_tg_poller(self):
+        cfg = load_telegram_config()
+        if not cfg or not cfg.get("bidirectional"):
+            return
+        self._tg_poller = TelegramPollerThread(cfg["bot_token"], cfg["chat_id"])
+        self._tg_poller.command_received.connect(self._on_telegram_command)
+        self._tg_poller.start()
+        logging.info("📨 텔레그램 양방향 제어 폴러 시작.")
+
+    def _stop_tg_poller(self):
+        if self._tg_poller and self._tg_poller.isRunning():
+            self._tg_poller.stop()
+            self._tg_poller.wait()
+            self._tg_poller = None
+
+    # ── 설정 다이얼로그 ────────────────────────────────────
     def open_settings(self):
         current_conf = {
             "generating": self.worker.generating_confidence,
-            "ready": self.worker.ready_confidence,
-            "limit": self.worker.limit_confidence,
+            "ready":      self.worker.ready_confidence,
+            "limit":      self.worker.limit_confidence,
         }
-        dialog = MessageSettingsDialog(self.worker.status_messages, self.worker.smart_prompt, current_conf, self)
-        if dialog.exec():
-            new_messages, new_prompt, new_conf = dialog.get_values()
-            self.worker.status_messages = new_messages
-            self.worker.smart_prompt = new_prompt
-            self.worker.generating_confidence = new_conf["generating"]
-            self.worker.ready_confidence = new_conf["ready"]
-            self.worker.limit_confidence = new_conf["limit"]
-            logging.info("⚙️ 상황별 메시지·프롬프트·화면 인식 신뢰도 설정이 저장되었습니다.")
+        dlg = MessageSettingsDialog(
+            self.worker.status_messages,
+            self.worker.smart_prompt,
+            current_conf,
+            self.worker.max_continue,
+            self,
+        )
+        if dlg.exec():
+            msgs, prompt, conf, max_c = dlg.get_values()
+            self.worker.status_messages        = msgs
+            self.worker.smart_prompt           = prompt
+            self.worker.generating_confidence  = conf["generating"]
+            self.worker.ready_confidence       = conf["ready"]
+            self.worker.limit_confidence       = conf["limit"]
+            self.worker.max_continue           = max_c
+            logging.info("⚙️ 환경 설정이 저장되었습니다.")
 
     def open_telegram_settings(self):
         TelegramSettingsDialog(self).exec()
 
+    # ── 기타 UI 슬롯 ──────────────────────────────────────
+    def update_offset(self, value: int):
+        self.worker.click_y_offset = value
+        logging.info(f"클릭 위치 오프셋이 {value}px 로 변경되었습니다.")
+
+    def toggle_continuous_mode(self, _):
+        on = self.cb_continuous.isChecked()
+        self.worker.continuous_mode = on
+        logging.info(f"연속 작업 모드가 {'ON' if on else 'OFF'} 되었습니다.")
+
+    def toggle_always_on_top(self, _):
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint,
+                           self.cb_always_on_top.isChecked())
+        self.show()
+
     def test_click_position(self):
         win = self.worker.get_claude_window()
         if not win:
-            logging.error("클로드 창을 찾을 수 없습니다. 창이 켜져 있는지 확인하세요.")
+            logging.error("클로드 창을 찾을 수 없습니다.")
             return
-
         try:
             if win.isMinimized:
                 win.restore()
             win.activate()
             time.sleep(0.3)
-
-            center_x = win.left + (win.width // 2)
-            bottom_y = win.bottom - self.spin_offset.value()
-
-            logging.info(f"테스트 좌표 이동 중... (X: {center_x}, Y: {bottom_y})")
-            pyautogui.moveTo(center_x, bottom_y, duration=0.5)
+            cx = win.left + (win.width // 2)
+            cy = win.bottom - self.spin_offset.value()
+            logging.info(f"테스트 클릭 → X:{cx} Y:{cy}")
+            pyautogui.moveTo(cx, cy, duration=0.5)
             pyautogui.click()
-            
-            logging.info("테스트 클릭이 완료되었습니다. 엉뚱한 곳을 클릭했다면 오프셋 수치를 조절해보세요.")
+            logging.info("테스트 클릭 완료. 엉뚱한 곳이면 Y오프셋을 조정하세요.")
         except Exception as e:
             logging.error(f"테스트 클릭 실패: {e}")
 
     def setup_logging(self):
         logger = logging.getLogger()
         logger.setLevel(logging.INFO)
-        
-        gui_handler = QTextEditLogger(self)
-        gui_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt="%H:%M:%S"))
-        logger.addHandler(gui_handler)
-        
-        # [완료] app.log 크기 기준 롤오버 — 2MB 도달 시 회전하고 백업 3개까지 보관해 무한 증식 방지
-        file_handler = logging.handlers.RotatingFileHandler(
-            "app.log", maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding='utf-8')
-        file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
-        logger.addHandler(file_handler)
+        gh = QTextEditLogger(self)
+        gh.setFormatter(logging.Formatter(
+            '%(asctime)s [%(levelname)s] %(message)s', datefmt="%H:%M:%S"))
+        logger.addHandler(gh)
+        fh = logging.handlers.RotatingFileHandler(
+            "app.log", maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT,
+            encoding='utf-8')
+        fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+        logger.addHandler(fh)
 
-    def append_log(self, msg, record):
+    def append_log(self, msg: str, record: logging.LogRecord):
         if record.levelno >= logging.ERROR:
-            formatted_msg = f"<span style='color: #ff5555;'>{msg}</span>"
+            html = f"<span style='color:#ff5555;'>{msg}</span>"
         elif record.levelno == logging.WARNING:
-            formatted_msg = f"<span style='color: #ffb86c;'>{msg}</span>"
-        elif "감지되었습니다" in msg or "완료되었습니다" in msg or "이동 중" in msg:
-            formatted_msg = f"<span style='color: #50fa7b;'>{msg}</span>"
+            html = f"<span style='color:#ffb86c;'>{msg}</span>"
+        elif any(k in msg for k in ("감지되었습니다", "완료되었습니다", "이동 중")):
+            html = f"<span style='color:#50fa7b;'>{msg}</span>"
         elif "[상태 변경]" in msg:
-            formatted_msg = f"<span style='color: #8be9fd;'>{msg}</span>"
+            html = f"<span style='color:#8be9fd;'>{msg}</span>"
         else:
-            formatted_msg = f"<span style='color: #d4d4d4;'>{msg}</span>"
-
-        self.log_console.appendHtml(formatted_msg)
-        scrollbar = self.log_console.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+            html = f"<span style='color:#d4d4d4;'>{msg}</span>"
+        self.log_console.appendHtml(html)
+        self.log_console.verticalScrollBar().setValue(
+            self.log_console.verticalScrollBar().maximum())
 
     def clear_logs(self):
         self.log_console.clear()
 
-    def toggle_always_on_top(self, _state):
-        is_checked = self.cb_always_on_top.isChecked()
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, is_checked)
-        self.show()  # 윈도우 속성(플래그)이 변경되면 화면에 다시 렌더링해야 함
-
-    def toggle_continuous_mode(self, _state):
-        is_checked = self.cb_continuous.isChecked()
-        self.worker.continuous_mode = is_checked
-        logging.info(f"무한 연속 작업 모드가 {'ON' if is_checked else 'OFF'} 되었습니다.")
-
-    def _sync_continuous_checkbox(self, on: bool):
-        """워커가 자동으로 연속 모드를 끌 때 GUI 체크박스를 신호 루프 없이 동기화한다."""
-        self.cb_continuous.blockSignals(True)
-        self.cb_continuous.setChecked(on)
-        self.cb_continuous.blockSignals(False)
-
-    def start_worker(self):
-        if self.worker.isRunning():
-            return
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.worker.start()
-
-    def stop_worker(self):
-        self.worker.stop()
-        self.worker.wait()
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        logging.info("감시가 중지되었습니다.")
-
-    def show_toast(self, message):
+    def show_toast(self, message: str):
         self.toast = ToastNotification(message)
         self.toast.show()
 
@@ -1466,32 +1762,33 @@ class MainWindow(QMainWindow):
         if getattr(self, "tray", None) and not getattr(self, "_force_quit", False):
             event.ignore()
             self.hide()
-            self.tray.showMessage(
-                APP_NAME,
-                "백그라운드에서 계속 실행 중입니다. 트레이 아이콘에서 종료할 수 있습니다.",
-                QSystemTrayIcon.MessageIcon.Information,
-                3000,
-            )
+            self.tray.showMessage(APP_NAME,
+                "백그라운드에서 계속 실행 중입니다. 트레이 아이콘에서 종료하세요.",
+                QSystemTrayIcon.MessageIcon.Information, 3000)
             return
-
+        self._stop_tg_poller()
+        if HAS_KEYBOARD:
+            try:
+                _keyboard_lib.remove_hotkey('f12')
+            except Exception:
+                pass
         if self.worker.isRunning():
             self.worker.stop()
             self.worker.wait()
-        if getattr(self, "tray", None):
+        if self.tray:
             self.tray.hide()
         super().closeEvent(event)
 
+# ---------------------------------------------------------
+# 14. 진입점
+# ---------------------------------------------------------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setWindowIcon(app_icon())
-
-    # [수정] 앱 전체의 기본 파란색 포인트를 스핀박스/버튼 배경색인 남색(#2c3e50)으로 일괄 변경
-    # (이렇게 하면 체크박스를 체크했을 때의 파란 배경도 동일한 남색으로 예쁘게 바뀝니다!)
     palette = app.palette()
     palette.setColor(palette.ColorRole.Highlight, QColor("#2c3e50"))
     app.setPalette(palette)
-
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
