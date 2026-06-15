@@ -1,0 +1,17 @@
+# 빌드 산출물 (큼)
+build/
+dist/
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# 런타임 파일
+app.log
+PAUSE.flag
+
+# 비밀: 텔레그램 봇 토큰이 들어갈 수 있음 (예시는 telegram_config.example.json 로 커밋)
+telegram_config.json
+
+# 실수로 생긴 내장 저장소
+AutoPilot/
