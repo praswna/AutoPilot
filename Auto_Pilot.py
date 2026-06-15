@@ -32,7 +32,7 @@ os.environ["QT_LOGGING_RULES"] = "qt.qpa.window=false"
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QCheckBox, QPlainTextEdit, QLabel, QDialog, QSpinBox,
-    QDoubleSpinBox, QFormLayout, QLineEdit, QDialogButtonBox, QGroupBox,
+    QFormLayout, QLineEdit, QDialogButtonBox, QGroupBox,
     QMessageBox, QScrollArea, QFrame, QSizePolicy,
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer, QObject
@@ -599,42 +599,11 @@ class TelegramPollerThread(QThread):
 # 10. 환경 설정 다이얼로그
 # ---------------------------------------------------------
 class MessageSettingsDialog(QDialog):
-    def __init__(self, current_prompt, current_conf,
-                 max_continue, parent=None):
+    def __init__(self, current_prompt, parent=None):
         super().__init__(parent)
         self.setWindowTitle("환경 설정")
-        self.resize(560, 620)
+        self.resize(560, 460)
         layout = QVBoxLayout(self)
-
-        # 화면 인식 신뢰도
-        conf_group = QGroupBox("화면 인식 신뢰도 (0.40~0.99)")
-        conf_form = QFormLayout()
-        self.conf_inputs = {}
-        conf_labels = {
-            "generating": "답변 작성 중(■):",
-            "ready":      "입력 대기(↵):",
-            "limit":      "사용량 한도 화면:",
-        }
-        for key, lbl in conf_labels.items():
-            sp = QDoubleSpinBox()
-            sp.setRange(0.40, 0.99)
-            sp.setSingleStep(0.01)
-            sp.setDecimals(2)
-            sp.setValue(float(current_conf.get(key, 0.80)))
-            self.conf_inputs[key] = sp
-            conf_form.addRow(lbl, sp)
-        conf_group.setLayout(conf_form)
-        layout.addWidget(conf_group)
-
-        # 스텝 모드 설정
-        step_group = QGroupBox("스텝 모드 설정")
-        step_form = QFormLayout()
-        self.spin_max_continue = QSpinBox()
-        self.spin_max_continue.setRange(1, 20)
-        self.spin_max_continue.setValue(max_continue)
-        step_form.addRow("최대 '계속' 횟수 (초과 시 자동 정지):", self.spin_max_continue)
-        step_group.setLayout(step_form)
-        layout.addWidget(step_group)
 
         # 클래식 모드 스마트 프롬프트
         prompt_group = QGroupBox("클래식 모드 스마트 프롬프트 (스텝 없을 때)")
@@ -650,11 +619,7 @@ class MessageSettingsDialog(QDialog):
         layout.addWidget(bb)
 
     def get_values(self):
-        return (
-            self.prompt_edit.toPlainText(),
-            {key: sp.value() for key, sp in self.conf_inputs.items()},
-            self.spin_max_continue.value(),
-        )
+        return self.prompt_edit.toPlainText()
 
 # ---------------------------------------------------------
 # 11. 스텝 아이템 위젯
@@ -1788,24 +1753,9 @@ class MainWindow(QMainWindow):
 
     # ── 설정 다이얼로그 ────────────────────────────────────
     def open_settings(self):
-        current_conf = {
-            "generating": self.worker.generating_confidence,
-            "ready":      self.worker.ready_confidence,
-            "limit":      self.worker.limit_confidence,
-        }
-        dlg = MessageSettingsDialog(
-            self.worker.smart_prompt,
-            current_conf,
-            self.worker.max_continue,
-            self,
-        )
+        dlg = MessageSettingsDialog(self.worker.smart_prompt, self)
         if dlg.exec():
-            prompt, conf, max_c = dlg.get_values()
-            self.worker.smart_prompt           = prompt
-            self.worker.generating_confidence  = conf["generating"]
-            self.worker.ready_confidence       = conf["ready"]
-            self.worker.limit_confidence       = conf["limit"]
-            self.worker.max_continue           = max_c
+            self.worker.smart_prompt = dlg.get_values()
             logging.info("⚙️ 환경 설정이 저장되었습니다.")
 
     def open_telegram_settings(self):
