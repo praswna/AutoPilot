@@ -985,18 +985,32 @@ class ClaudeWorker(QThread):
             # 다음 사이클에서 ready 감지 → _handle_generation_done → 스텝 완료 체크
             self.state = State.GENERATING
 
+    def _complete_step_cycle(self, claude_win):
+        """모든 스텝을 한 바퀴 완료했을 때 호출.
+        연속 모드면 Step 1로 루프백해 자율 루프를 계속하고,
+        아니면 감시만 유지한다."""
+        logging.info("🎉 모든 스텝이 완료되었습니다!")
+        if self.continuous_mode:
+            # 연속 루프 중 — 매 사이클 알림은 스팸이므로 로그만 남기고 Step 1로 루프백
+            with self._step_lock:
+                self.expected_step  = 1
+                self.continue_count = 0
+            self.step_progress_signal.emit(1, len(self.steps))
+            logging.info("🔁 Step 1부터 다시 루프를 시작합니다.")
+            self.state = State.RESUMING
+        else:
+            self._notify_all_done(claude_win)
+            self.continuous_mode_changed.emit(False)
+            self.state = State.MONITORING
+
     def _handle_generation_done(self, claude_win, frame):
         """답변 완료 후 스텝 모드 / 클래식 모드로 분기.
         스텝 목록이 있으면 continuous_mode와 무관하게 항상 스텝 모드로 동작한다.
         자동 전진(RESUMING)은 continuous_mode가 True일 때만 수행한다."""
         if self.steps:
-            # expected_step이 총 스텝 수를 초과한 경우 즉시 완료 처리
+            # expected_step이 총 스텝 수를 초과한 경우 한 사이클 완료 → 루프백
             if self.expected_step > len(self.steps):
-                logging.info("🎉 모든 스텝이 완료되었습니다! (초과 감지)")
-                self.continuous_mode = False
-                self.continuous_mode_changed.emit(False)
-                self._notify_all_done(claude_win)
-                self.state = State.MONITORING
+                self._complete_step_cycle(claude_win)
                 return
             step_done = self._check_step_complete(claude_win, frame)
             if step_done:
@@ -1006,11 +1020,7 @@ class ClaudeWorker(QThread):
                     self.expected_step += 1
                 self.step_progress_signal.emit(self.expected_step - 1, len(self.steps))
                 if self.expected_step > len(self.steps):
-                    logging.info("🎉 모든 스텝이 완료되었습니다!")
-                    self.continuous_mode = False
-                    self.continuous_mode_changed.emit(False)
-                    self._notify_all_done(claude_win)
-                    self.state = State.MONITORING
+                    self._complete_step_cycle(claude_win)
                 elif self.continuous_mode:
                     self.state = State.RESUMING
                 else:
