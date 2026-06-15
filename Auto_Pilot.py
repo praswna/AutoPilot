@@ -407,6 +407,7 @@ class TelegramSettingsDialog(QDialog):
         "<b>명령어 목록</b> (양방향 사용 시):<br>"
         "&nbsp;&nbsp;/status — 현재 상태 조회<br>"
         "&nbsp;&nbsp;/screen — 현재 화면 캡처 전송<br>"
+        "&nbsp;&nbsp;/send [메시지] — 클로드에 직접 메시지 전송<br>"
         "&nbsp;&nbsp;/stop — 감시 중지<br>"
         "&nbsp;&nbsp;/pause — 연속 모드 중단<br>"
         "&nbsp;&nbsp;/resume — 연속 모드 재개<br>"
@@ -537,7 +538,8 @@ class TelegramPollerThread(QThread):
                         # date 누락 시(비정상 페이로드)엔 만료 검사를 건너뛰고 처리한다.
                         age  = (time.time() - date) if date else 0
                         if age <= TELEGRAM_CMD_TTL:
-                            self.command_received.emit(text.split()[0])
+                            # 전체 메시지를 전달 — /send 등 인자 있는 명령을 위해
+                            self.command_received.emit(text)
                         else:
                             logging.info(f"⏰ 만료된 텔레그램 명령 무시 ({int(age)}초 경과): {text.split()[0]}")
                     if uid > self._last_update_id:
@@ -726,6 +728,10 @@ class ClaudeWorker(QThread):
         self._pause_reason  : str = ""
         self._step_lock     = threading.Lock()
 
+        # 원격 /send — 텔레그램에서 받은 사용자 메시지 큐 (워커 스레드에서 전송)
+        self._pending_sends : list[str] = []
+        self._send_lock     = threading.Lock()
+
         self.last_status_msg  = ""
         self.status_messages  = DEFAULT_MESSAGES.copy()
         self.smart_prompt     = SMART_PROMPT
@@ -745,6 +751,7 @@ class ClaudeWorker(QThread):
         logging.info("=========================================")
         while self.running:
             try:
+                self._flush_pending_sends()   # 원격 /send 우선 처리
                 self._update_state()
             except pyautogui.FailSafeException:
                 logging.error("FailSafe 발동 — 루프를 재개합니다.")
@@ -754,6 +761,54 @@ class ClaudeWorker(QThread):
 
     def stop(self):
         self.running = False
+
+    def queue_message(self, text: str):
+        """텔레그램 /send 로 받은 메시지를 전송 큐에 넣는다 (GUI 스레드에서 호출)."""
+        text = (text or "").strip()
+        if not text:
+            return
+        with self._send_lock:
+            self._pending_sends.append(text)
+
+    def _flush_pending_sends(self):
+        """큐에 쌓인 사용자 메시지를 워커 스레드에서 차례로 클로드에 붙여넣어 전송한다."""
+        with self._send_lock:
+            if not self._pending_sends:
+                return
+            pending = self._pending_sends
+            self._pending_sends = []
+        for text in pending:
+            if not self.running:
+                return
+            self._send_text_to_claude(text)
+
+    def _send_text_to_claude(self, text: str):
+        win = self._focus_claude_window()
+        if not win:
+            logging.error("클로드 창을 찾을 수 없어 /send 전송을 취소합니다.")
+            return
+        original_clipboard = safe_clipboard_paste()
+        try:
+            center_x = win.left + (win.width // 2)
+            bottom_y = win.bottom - self.click_y_offset
+            pyautogui.click(x=center_x, y=bottom_y)
+            time.sleep(0.5)
+            pyautogui.hotkey('ctrl', 'a')   # 기존 입력창 내용 정리
+            time.sleep(0.2)
+            pyperclip.copy(text)
+            time.sleep(0.2)
+            pyautogui.hotkey('ctrl', 'v')
+            time.sleep(0.5)
+            pyautogui.press('enter')
+            time.sleep(1)
+            logging.info(f"📨 /send 사용자 메시지를 전송했습니다: {text[:60]}")
+        except Exception as e:
+            logging.error(f"/send 전송 실패: {e}")
+        finally:
+            try:
+                pyperclip.copy(original_clipboard if original_clipboard else "")
+            except Exception as e:
+                logging.debug(f"클립보드 복구 실패: {e}")
 
     def force_next_step(self):
         """수동으로 다음 스텝으로 강제 이동 (GUI 슬롯에서 호출)."""
@@ -1513,7 +1568,7 @@ class MainWindow(QMainWindow):
         self.cb_continuous.blockSignals(False)
 
     # ── 텔레그램 명령 처리 ────────────────────────────────
-    def _on_telegram_command(self, cmd: str):
+    def _on_telegram_command(self, raw: str):
         cfg = load_telegram_config()
         token = cfg["bot_token"] if cfg else ""
         chat  = cfg["chat_id"]   if cfg else ""
@@ -1522,7 +1577,12 @@ class MainWindow(QMainWindow):
             if token and chat:
                 send_telegram_message(token, chat, text)
 
-        cmd = cmd.lower()
+        # 명령어 + 인자 분리 (예: "/send DB 연결부 다시 작성해")
+        parts = (raw or "").strip().split(maxsplit=1)
+        if not parts:
+            return
+        cmd = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else ""
         if cmd == "/status":
             steps_info = (f"스텝 {self.worker.expected_step}/{len(self.worker.steps)}"
                           if self.worker.steps else "클래식 모드")
@@ -1554,9 +1614,18 @@ class MainWindow(QMainWindow):
                 reply("[Auto-Pilot] 📸 현재 화면을 캡처해 전송합니다…")
                 # 캡처+업로드는 GUI를 막지 않도록 데몬 스레드에서 처리
                 threading.Thread(target=self._send_screen_capture, daemon=True).start()
+        elif cmd == "/send":
+            if not arg.strip():
+                reply("[Auto-Pilot] 사용법: /send <클로드에게 보낼 메시지>")
+            elif not self.worker.isRunning():
+                reply("[Auto-Pilot] 감시가 실행 중이 아닙니다. 먼저 시작 후 사용하세요.")
+            else:
+                # 워커 스레드가 다음 루프에서 클로드에 붙여넣어 전송 (충돌 방지)
+                self.worker.queue_message(arg)
+                reply(f"[Auto-Pilot] 📨 메시지를 전송 큐에 넣었습니다:\n{arg[:200]}")
         else:
             reply(f"[Auto-Pilot] 알 수 없는 명령: {cmd}\n"
-                  f"사용 가능: /status /screen /stop /pause /resume /next")
+                  f"사용 가능: /status /screen /send /stop /pause /resume /next")
         logging.info(f"📨 텔레그램 명령 수신: {cmd}")
 
     def _send_screen_capture(self):
