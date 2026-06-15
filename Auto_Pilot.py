@@ -599,32 +599,12 @@ class TelegramPollerThread(QThread):
 # 10. 환경 설정 다이얼로그
 # ---------------------------------------------------------
 class MessageSettingsDialog(QDialog):
-    def __init__(self, current_messages, current_prompt, current_conf,
+    def __init__(self, current_prompt, current_conf,
                  max_continue, parent=None):
         super().__init__(parent)
         self.setWindowTitle("환경 설정")
-        self.resize(560, 780)
+        self.resize(560, 620)
         layout = QVBoxLayout(self)
-
-        # 상황별 메시지
-        msg_group = QGroupBox("상황별 로그 메시지")
-        form = QFormLayout()
-        self.inputs = {}
-        labels = {
-            State.IDLE:       "대기 중 (창 닫힘):",
-            State.MONITORING: "감시 중 (입력 대기):",
-            State.GENERATING: "답변 작성 중:",
-            State.WAITING:    "한도 초과 대기:",
-            State.RESUMING:   "작업 지시 중:",
-            State.PAUSED:     "자동 일시 정지:",
-        }
-        for state, lbl in labels.items():
-            le = QLineEdit(current_messages[state])
-            self.inputs[state] = le
-            form.addRow(lbl, le)
-        msg_group.setLayout(form)
-        layout.addWidget(msg_group)
-        layout.addWidget(QLabel("※ '{mode}' ON/OFF, '{time}' 시간, '{reason}' 사유로 자동 치환됩니다."))
 
         # 화면 인식 신뢰도
         conf_group = QGroupBox("화면 인식 신뢰도 (0.40~0.99)")
@@ -671,7 +651,6 @@ class MessageSettingsDialog(QDialog):
 
     def get_values(self):
         return (
-            {state: le.text() for state, le in self.inputs.items()},
             self.prompt_edit.toPlainText(),
             {key: sp.value() for key, sp in self.conf_inputs.items()},
             self.spin_max_continue.value(),
@@ -1815,15 +1794,13 @@ class MainWindow(QMainWindow):
             "limit":      self.worker.limit_confidence,
         }
         dlg = MessageSettingsDialog(
-            self.worker.status_messages,
             self.worker.smart_prompt,
             current_conf,
             self.worker.max_continue,
             self,
         )
         if dlg.exec():
-            msgs, prompt, conf, max_c = dlg.get_values()
-            self.worker.status_messages        = msgs
+            prompt, conf, max_c = dlg.get_values()
             self.worker.smart_prompt           = prompt
             self.worker.generating_confidence  = conf["generating"]
             self.worker.ready_confidence       = conf["ready"]
