@@ -1126,9 +1126,6 @@ class ClaudeWorker(QThread):
             shot.save(tmp)
             caption = f"[Auto-Pilot] 계획 안정 — 정지됨 ({datetime.datetime.now():%Y-%m-%d %H:%M})"
             send_telegram_photo(tmp, caption)
-            backlog = self._extract_backlog_text(shot)
-            if backlog:
-                send_telegram_text("[Auto-Pilot] 📋 백로그\n" + backlog[:3500])
         except Exception as e:
             logging.error(f"정지 알림 처리 실패: {e}")
 
@@ -1137,17 +1134,6 @@ class ClaudeWorker(QThread):
         self._notify_stable(claude_win)   # 같은 캡처+텍스트 패턴 재사용
         if load_telegram_config():
             logging.info("📨 모든 스텝 완료 알림을 전송했습니다.")
-
-    def _extract_backlog_text(self, screenshot) -> str:
-        if screenshot is None or not self._ensure_ocr():
-            return ""
-        try:
-            results = ocr_reader.readtext(np.array(screenshot))
-            lines   = [t.strip() for _, t, _ in results if t and t.strip()]
-            return "\n".join(lines).strip()
-        except Exception as e:
-            logging.debug(f"백로그 OCR 실패: {e}")
-            return ""
 
     # ── 한도 대기 타이머 ────────────────────────────────────
     def _setup_wait_timer(self, claude_win, limit_pos):
