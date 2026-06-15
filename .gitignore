@@ -9,6 +9,7 @@ __pycache__/
 # 런타임 파일
 app.log
 PAUSE.flag
+window_config.json
 
 # 비밀: 텔레그램 봇 토큰이 들어갈 수 있음 (예시는 telegram_config.example.json 로 커밋)
 telegram_config.json
