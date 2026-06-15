@@ -84,6 +84,7 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 TELEGRAM_CONFIG_PATH = os.path.join(APP_DIR, "telegram_config.json")
+STEPS_CONFIG_PATH    = os.path.join(APP_DIR, "steps.json")
 
 # 클래식 모드용 스마트 프롬프트 (스텝 목록이 없을 때 사용)
 SMART_PROMPT = """[중요 지시사항: 아래 판단 흐름에 따라 현재 상황에 맞는 **단 하나의 STEP만** 실행할 것. 절대 여러 STEP을 한 번에 섞어서 실행하지 마라.]
@@ -213,6 +214,31 @@ def safe_clipboard_paste() -> str:
     except Exception as e:
         logging.debug(f"클립보드 읽기 실패: {e}")
         return ""
+
+def save_steps(steps: list[str]) -> bool:
+    """스텝 텍스트 목록을 steps.json에 저장한다."""
+    try:
+        with open(STEPS_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"steps": steps}, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        logging.warning(f"스텝 저장 실패: {e}")
+        return False
+
+def load_steps() -> list[str] | None:
+    """steps.json에서 스텝 텍스트 목록을 복원한다. 없으면 None."""
+    try:
+        with open(STEPS_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logging.warning(f"스텝 읽기 실패: {e}")
+        return None
+    steps = data.get("steps")
+    if isinstance(steps, list):
+        return [str(s) for s in steps]
+    return None
 
 # ---------------------------------------------------------
 # 3. 텔레그램 헬퍼
@@ -722,6 +748,8 @@ class StepManagerDialog(QDialog):
         layout.addLayout(step_ctrl)
 
     def closeEvent(self, event):
+        # 창을 닫을 때(숨길 때) 현재 스텝을 저장해 다음 실행에 복원한다.
+        save_steps([item.get_text() for item in self._step_items])
         self.hide()
         event.ignore()
 
@@ -1567,9 +1595,11 @@ class MainWindow(QMainWindow):
                      self._step_dlg.activateWindow())
         )
 
-        # 기본 스텝 삽입
-        for default_text in DEFAULT_STEPS:
-            self._step_dlg.add_step(text=default_text)
+        # 저장된 스텝 복원 — 없으면 기본 스텝 삽입
+        saved = load_steps()
+        initial_steps = saved if saved is not None else DEFAULT_STEPS
+        for step_text in initial_steps:
+            self._step_dlg.add_step(text=step_text)
         self._update_progress_label()
 
         screen_geom = QApplication.primaryScreen().availableGeometry()
@@ -1902,6 +1932,8 @@ class MainWindow(QMainWindow):
         self.toast.show()
 
     def closeEvent(self, event):
+        # 종료 시 현재 스텝을 저장해 다음 실행에 복원한다.
+        save_steps([item.get_text() for item in self._step_dlg._step_items])
         self._stop_tg_poller()
         if HAS_KEYBOARD:
             try:
