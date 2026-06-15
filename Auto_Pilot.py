@@ -934,8 +934,26 @@ class ClaudeWorker(QThread):
                 self.state = State.RESUMING
                 return
             if datetime.datetime.now() >= self.target_time:
-                logging.info("대기 시간이 종료되었습니다. 재개를 시도합니다.")
-                self.state = State.RESUMING
+                logging.info("대기 시간이 종료되었습니다. 입력창 클릭 후 한도 해제 여부를 확인합니다.")
+                try:
+                    center_x = claude_win.left + (claude_win.width // 2)
+                    bottom_y  = claude_win.bottom - self.click_y_offset
+                    pyautogui.click(x=center_x, y=bottom_y)
+                    logging.info("입력창 클릭 완료. 3초 대기 후 한도 화면 재확인합니다.")
+                except Exception as e:
+                    logging.warning(f"입력창 클릭 실패: {e}")
+                self._interruptible_sleep(3)
+                if not self.running:
+                    return
+                fresh = self._grab_window_frame(claude_win)
+                still_limited, _ = self._locate_rate_limit(claude_win, fresh)
+                if still_limited is None:
+                    logging.info("한도 화면이 사라졌습니다. 즉시 재개합니다.")
+                    self.target_time = None
+                    self.state = State.RESUMING
+                else:
+                    logging.info("한도 화면이 여전히 표시 중입니다. 대기를 계속합니다.")
+                    self._setup_wait_timer(claude_win, still_limited)
 
         elif self.state == State.RESUMING:
             self._execute_smart_resume()
