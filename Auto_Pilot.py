@@ -533,7 +533,9 @@ class TelegramPollerThread(QThread):
                     chat_id = str(msg.get("chat", {}).get("id", ""))
                     # chat_id 필터(보안) + 만료 필터(오래된 명령 폭주 방지)
                     if text.startswith("/") and chat_id == self.chat_id:
-                        age = time.time() - msg.get("date", 0)
+                        date = msg.get("date")
+                        # date 누락 시(비정상 페이로드)엔 만료 검사를 건너뛰고 처리한다.
+                        age  = (time.time() - date) if date else 0
                         if age <= TELEGRAM_CMD_TTL:
                             self.command_received.emit(text.split()[0])
                         else:
@@ -1282,6 +1284,7 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         self._tg_poller: TelegramPollerThread | None = None
         self._step_items: list[StepItemWidget] = []
+        self._screen_busy = False   # /screen 중복 캡처 방지 플래그
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1579,9 +1582,14 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._on_force_next)
             reply(f"[Auto-Pilot] 강제 다음 스텝 → Step {next_n}")
         elif cmd == "/screen":
-            reply("[Auto-Pilot] 📸 현재 화면을 캡처해 전송합니다…")
-            # 캡처+업로드는 GUI를 막지 않도록 데몬 스레드에서 처리
-            threading.Thread(target=self._send_screen_capture, daemon=True).start()
+            # _on_telegram_command은 메인 스레드 단독 실행 → 플래그 검사·설정에 경쟁 없음.
+            if self._screen_busy:
+                reply("[Auto-Pilot] 이미 화면 캡처가 진행 중입니다. 잠시 후 다시 시도하세요.")
+            else:
+                self._screen_busy = True
+                reply("[Auto-Pilot] 📸 현재 화면을 캡처해 전송합니다…")
+                # 캡처+업로드는 GUI를 막지 않도록 데몬 스레드에서 처리
+                threading.Thread(target=self._send_screen_capture, daemon=True).start()
         else:
             reply(f"[Auto-Pilot] 알 수 없는 명령: {cmd}\n"
                   f"사용 가능: /status /screen /stop /pause /resume /next")
@@ -1607,6 +1615,7 @@ class MainWindow(QMainWindow):
                     os.remove(tmp)
                 except OSError:
                     pass
+            self._screen_busy = False
 
     # ── 감시 시작/중지 ────────────────────────────────────
     def start_worker(self):
@@ -1682,7 +1691,15 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._after_emergency_stop)
 
     def _after_emergency_stop(self):
-        self.worker.wait(6000)
+        if not self.worker.wait(6000):
+            # 6초 내 종료 실패 — UI를 풀면 살아있는 워커 위에 새 워커가 겹칠 수 있다.
+            logging.error("🚨 워커가 6초 내 종료되지 않았습니다 — 잠금을 유지합니다.")
+            QMessageBox.warning(
+                self, "긴급 정지",
+                "워커가 정상적으로 종료되지 않았습니다.\n"
+                "잠시 후 자동 정리되며, 계속 멈춰 있으면 앱을 재시작하세요.",
+            )
+            return
         self._lock_ui(False)
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
