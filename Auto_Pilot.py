@@ -902,7 +902,9 @@ class ClaudeWorker(QThread):
         elif self.state == State.RESUMING:
             self._execute_smart_resume()
             self.target_time = None
-            self.state = State.MONITORING
+            # 전송 직후 GENERATING으로 전환: Claude가 빠르게 응답해도
+            # 다음 사이클에서 ready 감지 → _handle_generation_done → 스텝 완료 체크
+            self.state = State.GENERATING
 
     def _handle_generation_done(self, claude_win, frame):
         """답변 완료 후 스텝 모드 / 클래식 모드로 분기.
