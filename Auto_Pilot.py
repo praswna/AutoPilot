@@ -1587,6 +1587,31 @@ class MainWindow(QMainWindow):
         )
         self.btn_collapse.clicked.connect(self.toggle_collapsed)
         collapse_row.addWidget(self.btn_collapse)
+
+        # 접힌 상태 전용 미니 시작/중지 버튼 (펼친 상태에서는 숨김)
+        self.btn_start_mini = QPushButton("▶ 시작")
+        self.btn_start_mini.setStyleSheet(
+            "QPushButton { background:#2ecc71; color:white; font-weight:bold;"
+            " padding:3px 12px; border-radius:4px; }"
+            "QPushButton:hover { background:#27ae60; }"
+            "QPushButton:disabled { background:#95a5a6; }"
+        )
+        self.btn_start_mini.clicked.connect(self.start_worker)
+        self.btn_start_mini.setVisible(False)
+        collapse_row.addWidget(self.btn_start_mini)
+
+        self.btn_stop_mini = QPushButton("■ 중지")
+        self.btn_stop_mini.setStyleSheet(
+            "QPushButton { background:#e74c3c; color:white; font-weight:bold;"
+            " padding:3px 12px; border-radius:4px; }"
+            "QPushButton:hover { background:#c0392b; }"
+            "QPushButton:disabled { background:#95a5a6; }"
+        )
+        self.btn_stop_mini.clicked.connect(self.stop_worker)
+        self.btn_stop_mini.setEnabled(False)
+        self.btn_stop_mini.setVisible(False)
+        collapse_row.addWidget(self.btn_stop_mini)
+
         collapse_row.addStretch()
         root.addLayout(collapse_row)
 
@@ -1855,8 +1880,7 @@ class MainWindow(QMainWindow):
         self._start_tg_poller()
 
         self._lock_ui(True)
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
+        self._set_running_ui(True)
         self._update_progress_label(1 if steps else 0)
         # 감시 시작 시 Claude 창을 앞으로 가져와 Auto-Pilot에 가리지 않게 함
         win = self.worker.get_claude_window()
@@ -1885,11 +1909,17 @@ class MainWindow(QMainWindow):
                 pass
         self._stop_tg_poller()
 
+    def _set_running_ui(self, running: bool):
+        """메인·미니 시작/중지 버튼의 활성 상태를 함께 갱신한다."""
+        self.btn_start.setEnabled(not running)
+        self.btn_stop.setEnabled(running)
+        self.btn_start_mini.setEnabled(not running)
+        self.btn_stop_mini.setEnabled(running)
+
     def _reset_ui_after_stop(self):
         """감시 종료 후 버튼·잠금·진행 표시를 초기 상태로 되돌린다."""
         self._lock_ui(False)
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
+        self._set_running_ui(False)
         self.btn_force_next.setEnabled(False)
         self._step_dlg.set_step_active(0, 0)
         self._update_progress_label()
@@ -1917,8 +1947,7 @@ class MainWindow(QMainWindow):
             )
             return
         self._lock_ui(False)
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
+        self._set_running_ui(False)
         self.btn_force_next.setEnabled(False)
         logging.warning("🚨 F12 긴급 정지!")
 
@@ -1969,6 +1998,9 @@ class MainWindow(QMainWindow):
         for w in (self._top_widget, self._offset_frame,
                   self._progress_widget, self._action_widget):
             w.setVisible(not self._collapsed)
+        # 접힌 상태에서는 펼치기 버튼 옆 미니 시작/중지 버튼을 노출
+        self.btn_start_mini.setVisible(self._collapsed)
+        self.btn_stop_mini.setVisible(self._collapsed)
         if self._collapsed:
             self.btn_collapse.setText("🔼 펼치기")
             # 접힌 상태에서 창을 작게 줄일 수 있도록 최소 크기 제한 완화
