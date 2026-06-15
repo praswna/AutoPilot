@@ -1601,6 +1601,12 @@ class MainWindow(QMainWindow):
         self.cb_loop_forever_mini.stateChanged.connect(self._on_loop_forever_mini)
         collapse_row.addWidget(self.cb_loop_forever_mini)
 
+        self.cb_always_on_top_mini = QCheckBox("📌 위")
+        self.cb_always_on_top_mini.setToolTip("항상 위 고정")
+        self.cb_always_on_top_mini.setVisible(False)
+        self.cb_always_on_top_mini.stateChanged.connect(self._on_always_on_top_mini)
+        collapse_row.addWidget(self.cb_always_on_top_mini)
+
         # 접힌 상태 전용 미니 시작/중지 버튼 (펼친 상태에서는 숨김)
         self.btn_start_mini = QPushButton("▶ 시작")
         self.btn_start_mini.setStyleSheet(
@@ -2029,6 +2035,7 @@ class MainWindow(QMainWindow):
         self.btn_stop_mini.setVisible(self._collapsed)
         self.cb_continuous_mini.setVisible(self._collapsed)
         self.cb_loop_forever_mini.setVisible(self._collapsed)
+        self.cb_always_on_top_mini.setVisible(self._collapsed)
         if self._collapsed:
             self.btn_collapse.setText("🔼 펼치기")
             # 접힌 상태에서 창을 작게 줄일 수 있도록 최소 크기 제한 완화
@@ -2037,9 +2044,15 @@ class MainWindow(QMainWindow):
             self.btn_collapse.setText("🔽 로그만 보기")
 
     def toggle_always_on_top(self, _):
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint,
-                           self.cb_always_on_top.isChecked())
+        on = self.cb_always_on_top.isChecked()
+        self.cb_always_on_top_mini.blockSignals(True)
+        self.cb_always_on_top_mini.setChecked(on)
+        self.cb_always_on_top_mini.blockSignals(False)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
         self.show()
+
+    def _on_always_on_top_mini(self, _):
+        self.cb_always_on_top.setChecked(self.cb_always_on_top_mini.isChecked())
 
     def test_click_position(self):
         win = self.worker.get_claude_window()
