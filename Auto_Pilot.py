@@ -13,6 +13,7 @@ import logging.handlers
 import glob
 import json
 import tempfile
+import threading
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -521,14 +522,14 @@ class TelegramPollerThread(QThread):
                 updates = telegram_get_updates(self.bot_token, self._last_update_id + 1)
                 for upd in updates:
                     uid = upd.get("update_id", 0)
-                    if uid > self._last_update_id:
-                        self._last_update_id = uid
                     msg  = upd.get("message", {})
                     text = msg.get("text", "").strip()
-                    from_id = str(msg.get("from", {}).get("id", ""))
-                    # chat_id 필터: 설정된 계정에서 보낸 명령만 처리
-                    if text.startswith("/") and from_id == self.chat_id:
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                    # chat_id 필터: 설정된 대화에서 보낸 명령만 처리
+                    if text.startswith("/") and chat_id == self.chat_id:
                         self.command_received.emit(text.split()[0])
+                    if uid > self._last_update_id:
+                        self._last_update_id = uid
             except Exception as e:
                 logging.debug(f"텔레그램 폴링 오류: {e}")
             self._sleep(5)
@@ -711,6 +712,7 @@ class ClaudeWorker(QThread):
         self.continue_count : int = 0
         self.max_continue   : int = MAX_CONTINUE_DEFAULT
         self._pause_reason  : str = ""
+        self._step_lock     = threading.Lock()
 
         self.last_status_msg  = ""
         self.status_messages  = DEFAULT_MESSAGES.copy()
@@ -745,8 +747,9 @@ class ClaudeWorker(QThread):
         """수동으로 다음 스텝으로 강제 이동 (GUI 슬롯에서 호출)."""
         if not self.steps:
             return
-        self.continue_count = 0
-        self.expected_step  = min(self.expected_step + 1, len(self.steps) + 1)
+        with self._step_lock:
+            self.continue_count = 0
+            self.expected_step  = min(self.expected_step + 1, len(self.steps) + 1)
         logging.info(f"⏭ 강제 다음 스텝 → Step {self.expected_step}/{len(self.steps)}")
         if self.state == State.PAUSED:
             if self.expected_step > len(self.steps):
@@ -839,8 +842,9 @@ class ClaudeWorker(QThread):
             step_done = self._check_step_complete(claude_win, frame)
             if step_done:
                 logging.info(f"✅ Step {self.expected_step}/{len(self.steps)} 완료 확인!")
-                self.continue_count = 0
-                self.expected_step += 1
+                with self._step_lock:
+                    self.continue_count = 0
+                    self.expected_step += 1
                 self.step_progress_signal.emit(self.expected_step - 1, len(self.steps))
                 if self.expected_step > len(self.steps):
                     logging.info("🎉 모든 스텝이 완료되었습니다!")
@@ -851,7 +855,8 @@ class ClaudeWorker(QThread):
                 else:
                     self.state = State.RESUMING
             else:
-                self.continue_count += 1
+                with self._step_lock:
+                    self.continue_count += 1
                 logging.info(f"Step {self.expected_step} 완료 미감지 ({self.continue_count}/{self.max_continue})")
                 if self.continue_count >= self.max_continue:
                     self._pause_reason = (
@@ -1082,7 +1087,7 @@ class ClaudeWorker(QThread):
         n      = self.expected_step
         prefix = f"step{n}_complete"
         if glob.glob(resource_path(f"{prefix}*.png")):
-            return self._match_any(prefix, claude_win, self.generating_confidence, frame)
+            return self._match_any(prefix, claude_win, self.ready_confidence, frame)
         # OCR 폴백: [STEP{N}_DONE] 토큰 검사
         return self._check_token_ocr(claude_win, f"[STEP{n}_DONE]")
 
@@ -1118,7 +1123,8 @@ class ClaudeWorker(QThread):
     def _notify_all_done(self, claude_win):
         """모든 스텝 완료 시 텔레그램 알림."""
         self._notify_stable(claude_win)   # 같은 캡처+텍스트 패턴 재사용
-        logging.info("📨 모든 스텝 완료 알림을 전송했습니다.")
+        if load_telegram_config():
+            logging.info("📨 모든 스텝 완료 알림을 전송했습니다.")
 
     def _extract_backlog_text(self, screenshot) -> str:
         if screenshot is None or not self._ensure_ocr():
@@ -1559,8 +1565,9 @@ class MainWindow(QMainWindow):
                 self.worker.state = State.RESUMING
             reply("[Auto-Pilot] 연속 모드를 ON했습니다.")
         elif cmd == "/next":
+            next_n = min(self.worker.expected_step + 1, len(self.worker.steps) + 1) if self.worker.steps else 1
             QTimer.singleShot(0, self._on_force_next)
-            reply(f"[Auto-Pilot] 강제 다음 스텝 → {self.worker.expected_step + 1}")
+            reply(f"[Auto-Pilot] 강제 다음 스텝 → Step {next_n}")
         else:
             reply(f"[Auto-Pilot] 알 수 없는 명령: {cmd}\n"
                   f"사용 가능: /status /stop /pause /resume /next")
@@ -1594,9 +1601,10 @@ class MainWindow(QMainWindow):
                 logging.warning("⚠️ easyocr 없음 — 스텝 완료 감지는 이미지 매칭으로만 동작합니다.")
 
         # 워커 초기화
-        self.worker.steps         = steps
-        self.worker.expected_step = 1
-        self.worker.continue_count = 0
+        self.worker.steps           = steps
+        self.worker.expected_step   = 1
+        self.worker.continue_count  = 0
+        self.worker.continuous_mode = self.cb_continuous.isChecked()
 
         # F12 전역 긴급 정지 등록
         if HAS_KEYBOARD:
@@ -1639,7 +1647,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._after_emergency_stop)
 
     def _after_emergency_stop(self):
-        self.worker.wait()
+        self.worker.wait(6000)
         self._lock_ui(False)
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
