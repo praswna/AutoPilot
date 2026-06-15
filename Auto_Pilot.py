@@ -843,6 +843,7 @@ class ClaudeWorker(QThread):
         self.expected_step  : int = 1    # 1-based
         self.continue_count : int = 0
         self.max_continue   : int = MAX_CONTINUE_DEFAULT
+        self.loop_forever   : bool = False   # 모든 스텝 완료 후 Step 1로 무한 반복
         self._pause_reason  : str = ""
         self._step_lock     = threading.Lock()
 
@@ -1043,8 +1044,17 @@ class ClaudeWorker(QThread):
 
     def _complete_step_cycle(self, claude_win):
         """모든 스텝을 한 바퀴 완료했을 때 호출.
-        연속 모드면 Step 1로 루프백해 자율 루프를 계속하고,
-        아니면 감시만 유지한다."""
+        무한 반복 모드면 Step 1로 루프백해 계속 순환하고,
+        아니면 스크린샷 전송 후 감시를 종료한다."""
+        if self.loop_forever and self.continuous_mode:
+            # 무한 반복 — 매 사이클 알림은 스팸이므로 로그만 남기고 Step 1로 루프백
+            logging.info("🔁 모든 스텝 완료 — 무한 반복 모드: Step 1부터 다시 시작합니다.")
+            with self._step_lock:
+                self.expected_step  = 1
+                self.continue_count = 0
+            self.step_progress_signal.emit(1, len(self.steps))
+            self.state = State.RESUMING
+            return
         logging.info("🎉 모든 스텝이 완료되었습니다! 스크린샷을 전송하고 감시를 종료합니다.")
         # 완료 알림(스크린샷) 전송
         self._notify_all_done(claude_win)
@@ -1483,6 +1493,15 @@ class MainWindow(QMainWindow):
         self.cb_continuous.stateChanged.connect(self.toggle_continuous_mode)
         top_bar.addWidget(self.cb_continuous)
 
+        self.cb_loop_forever = QCheckBox("🔁 무한 반복")
+        self.cb_loop_forever.setFont(QFont("Malgun Gothic", 10, QFont.Weight.Bold))
+        self.cb_loop_forever.setToolTip(
+            "체크 시 모든 스텝 완료 후 Step 1부터 무한 반복합니다.\n"
+            "해제 시 한 바퀴 완료하면 스크린샷 전송 후 자동 정지합니다."
+        )
+        self.cb_loop_forever.stateChanged.connect(self.toggle_loop_forever)
+        top_bar.addWidget(self.cb_loop_forever)
+
         self.cb_always_on_top = QCheckBox("📌 항상 위 고정")
         self.cb_always_on_top.setFont(QFont("Malgun Gothic", 10, QFont.Weight.Bold))
         self.cb_always_on_top.stateChanged.connect(self.toggle_always_on_top)
@@ -1502,7 +1521,9 @@ class MainWindow(QMainWindow):
             )
             btn.clicked.connect(slot)
             top_bar.addWidget(btn)
-        root.addLayout(top_bar)
+        self._top_widget = QWidget()
+        self._top_widget.setLayout(top_bar)
+        root.addWidget(self._top_widget)
 
         # ── Y오프셋 + 위치 테스트 ─────────────────────────
         offset_frame = QWidget()
@@ -1543,6 +1564,7 @@ class MainWindow(QMainWindow):
         )
         ofl.addWidget(btn_step_mgr)
 
+        self._offset_frame = offset_frame
         root.addWidget(offset_frame)
 
         # 진행 상황 라벨 (메인 창에 유지)
@@ -1551,7 +1573,22 @@ class MainWindow(QMainWindow):
         self.lbl_progress.setStyleSheet("color:#888; font-size:9pt;")
         progress_row.addWidget(self.lbl_progress)
         progress_row.addStretch()
-        root.addLayout(progress_row)
+        self._progress_widget = QWidget()
+        self._progress_widget.setLayout(progress_row)
+        root.addWidget(self._progress_widget)
+
+        # ── 접기/펼치기 토글 (항상 보임) ──────────────────
+        collapse_row = QHBoxLayout()
+        self.btn_collapse = QPushButton("🔽 로그만 보기")
+        self.btn_collapse.setStyleSheet(
+            "QPushButton { background-color:#566573; color:white; font-weight:bold;"
+            " padding:3px 12px; border-radius:4px; }"
+            "QPushButton:hover { background-color:#6c7a89; }"
+        )
+        self.btn_collapse.clicked.connect(self.toggle_collapsed)
+        collapse_row.addWidget(self.btn_collapse)
+        collapse_row.addStretch()
+        root.addLayout(collapse_row)
 
         # ── 로그 콘솔 ─────────────────────────────────────
         self.log_console = QPlainTextEdit()
@@ -1600,7 +1637,10 @@ class MainWindow(QMainWindow):
         self.btn_force_next.setEnabled(False)
         action_bar.addWidget(self.btn_force_next)
 
-        root.addLayout(action_bar)
+        self._action_widget = QWidget()
+        self._action_widget.setLayout(action_bar)
+        root.addWidget(self._action_widget)
+        self._collapsed = False
 
         # ── 워커 및 로깅 연결 ─────────────────────────────
         self.worker = ClaudeWorker()
@@ -1801,6 +1841,7 @@ class MainWindow(QMainWindow):
         self.worker.expected_step   = 1
         self.worker.continue_count  = 0
         self.worker.continuous_mode = self.cb_continuous.isChecked()
+        self.worker.loop_forever    = self.cb_loop_forever.isChecked()
 
         # F12 전역 긴급 정지 등록
         if HAS_KEYBOARD:
@@ -1916,6 +1957,24 @@ class MainWindow(QMainWindow):
         on = self.cb_continuous.isChecked()
         self.worker.continuous_mode = on
         logging.info(f"연속 작업 모드가 {'ON' if on else 'OFF'} 되었습니다.")
+
+    def toggle_loop_forever(self, _):
+        on = self.cb_loop_forever.isChecked()
+        self.worker.loop_forever = on
+        logging.info(f"무한 반복 모드가 {'ON' if on else 'OFF'} 되었습니다.")
+
+    def toggle_collapsed(self):
+        """로그만 보이도록 접거나, 모든 컨트롤을 다시 펼친다."""
+        self._collapsed = not self._collapsed
+        for w in (self._top_widget, self._offset_frame,
+                  self._progress_widget, self._action_widget):
+            w.setVisible(not self._collapsed)
+        if self._collapsed:
+            self.btn_collapse.setText("🔼 펼치기")
+            # 접힌 상태에서 창을 작게 줄일 수 있도록 최소 크기 제한 완화
+            self.setMinimumSize(0, 0)
+        else:
+            self.btn_collapse.setText("🔽 로그만 보기")
 
     def toggle_always_on_top(self, _):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint,
