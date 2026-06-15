@@ -1,7 +1,7 @@
 # ==========================================
-# Auto-Pilot v1.2.0
+# Auto-Pilot v1.3.0
 # ==========================================
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 import os
 import sys
@@ -9,6 +9,7 @@ import time
 import datetime
 import re
 import logging
+import logging.handlers  # [제안] app.log 크기 기준 롤오버용
 import glob  # [추가] 파일 패턴 검색을 위한 모듈
 import json       # 텔레그램 설정(telegram_config.json) 읽기용
 import tempfile   # 백로그 캡처 임시 저장용
@@ -16,6 +17,7 @@ import urllib.request  # 텔레그램 API 호출용(외부 의존성 없이 stdl
 import urllib.parse
 import urllib.error
 from enum import Enum
+from collections import namedtuple
 
 # PyQt6 윈도우 DPI 관련 경고 메시지 숨김 처리
 os.environ["QT_LOGGING_RULES"] = "qt.qpa.window=false"
@@ -23,7 +25,7 @@ os.environ["QT_LOGGING_RULES"] = "qt.qpa.window=false"
 # PyQt6 패키지
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QCheckBox, QPlainTextEdit,
-                             QLabel, QDialog, QSpinBox, QFormLayout, QLineEdit, QDialogButtonBox, QGroupBox,
+                             QLabel, QDialog, QSpinBox, QDoubleSpinBox, QFormLayout, QLineEdit, QDialogButtonBox, QGroupBox,
                              QSystemTrayIcon, QMenu, QMessageBox)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer, QObject
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QBrush
@@ -56,6 +58,21 @@ FALLBACK_WAIT_MINUTES = 30
 CONFIDENCE_LEVEL = 0.8
 PAST_TIME_GRACE_MINUTES = 5
 MAX_INPUT_LEN = 4000
+
+# [제안 #2·#3] 화면 템플릿 매칭 기본 신뢰도 (환경 설정창에서 0.40~0.99 범위로 조정 가능).
+#   - 생성(■)/완료(↵)는 단계적 신뢰도 사다리의 기준값으로 쓰인다.
+#   - 한도 화면은 오탐 차단을 위해 더 엄격(컬러 비교)하게 둔다.
+GENERATING_CONFIDENCE = 0.80
+READY_CONFIDENCE = 0.80
+LIMIT_CONFIDENCE = 0.90
+
+# [대기→완료] app.log 파일이 무한정 커지지 않도록 크기 기준 롤오버를 적용한다.
+LOG_MAX_BYTES = 2 * 1024 * 1024   # 2MB 도달 시 회전
+LOG_BACKUP_COUNT = 3              # app.log + .1 ~ .3 백업 유지
+
+# [제안 #1] 주기당 1회 캡처한 화면에서 찾은 좌표를 절대 화면 기준으로 담는 경량 박스.
+# pyautogui.Box(namedtuple)와 같은 필드(.left/.top/.width/.height)라 호출부 호환된다.
+ScreenBox = namedtuple("ScreenBox", "left top width height")
 
 # 계획이 안정되면 Claude가 응답 끝에 출력하는 토큰. OCR로 감지하면 연속 모드를 자동 종료한다.
 STABLE_TOKEN = "LOOPSTABLE"
@@ -218,6 +235,18 @@ def send_telegram_message(bot_token: str, chat_id: str, text: str) -> tuple[bool
         return False, f"HTTP {e.code}: {detail[:200]}"
     except Exception as e:
         return False, f"오류: {e}"
+
+
+def send_telegram_text(text: str) -> bool:
+    """telegram_config.json 설정이 있으면 텍스트 메시지를 보낸다. 설정 없으면 조용히 건너뜀.
+    (정지 알림에 백로그 텍스트를 동봉할 때 사용)"""
+    cfg = load_telegram_config()
+    if not cfg:
+        return False
+    ok, msg = send_telegram_message(cfg["bot_token"], cfg["chat_id"], text)
+    if not ok:
+        logging.warning(f"텔레그램 백로그 텍스트 전송 실패: {msg}")
+    return ok
 
 
 def send_telegram_photo(image_path: str, caption: str) -> bool:
@@ -501,10 +530,10 @@ class TelegramSettingsDialog(QDialog):
 
 
 class MessageSettingsDialog(QDialog):
-    def __init__(self, current_messages, current_prompt, parent=None):
+    def __init__(self, current_messages, current_prompt, current_conf, parent=None):
         super().__init__(parent)
         self.setWindowTitle("상황별 메시지 및 설정")
-        self.resize(550, 650)
+        self.resize(550, 720)
         
         layout = QVBoxLayout(self)
 
@@ -532,7 +561,32 @@ class MessageSettingsDialog(QDialog):
         info_label = QLabel("※ '{mode}'는 ON/OFF로, '{time}'은 시간으로 자동 치환됩니다.")
         info_label.setStyleSheet("color: #888888; font-size: 9pt;")
         layout.addWidget(info_label)
-        
+
+        # 화면 인식 신뢰도 설정 그룹 (제안 #2·#3)
+        conf_group = QGroupBox("화면 인식 신뢰도 (0.40~0.99 · 높을수록 엄격, 오탐↓ 미탐↑)")
+        conf_form = QFormLayout()
+        self.conf_inputs = {}
+        conf_labels = {
+            "generating": "답변 작성 중(■) 감지:",
+            "ready": "입력 대기(↵) 감지:",
+            "limit": "사용량 한도 화면 감지:",
+        }
+        for key, label_text in conf_labels.items():
+            spin = QDoubleSpinBox()
+            spin.setRange(0.40, 0.99)
+            spin.setSingleStep(0.01)
+            spin.setDecimals(2)
+            spin.setValue(float(current_conf.get(key, 0.80)))
+            self.conf_inputs[key] = spin
+            conf_form.addRow(label_text, spin)
+        conf_group.setLayout(conf_form)
+        layout.addWidget(conf_group)
+
+        conf_info = QLabel("※ 생성/대기 감지는 이 값을 기준으로 흑백·컬러 신뢰도를 단계적으로 낮춰가며 재시도합니다.")
+        conf_info.setStyleSheet("color: #888888; font-size: 9pt;")
+        conf_info.setWordWrap(True)
+        layout.addWidget(conf_info)
+
         # 스마트 프롬프트 설정 그룹
         prompt_group = QGroupBox("스마트 프롬프트 설정 (입력창 비어있을 때 자동 전송할 텍스트)")
         prompt_layout = QVBoxLayout()
@@ -549,7 +603,8 @@ class MessageSettingsDialog(QDialog):
     def get_values(self):
         new_messages = {state: edit.text() for state, edit in self.inputs.items()}
         new_prompt = self.prompt_edit.toPlainText()
-        return new_messages, new_prompt
+        new_conf = {key: spin.value() for key, spin in self.conf_inputs.items()}
+        return new_messages, new_prompt, new_conf
 
 class ClaudeWorker(QThread):
     toast_signal = pyqtSignal(str)
@@ -562,7 +617,12 @@ class ClaudeWorker(QThread):
         self.target_time = None
         self.continuous_mode = False
         self.click_y_offset = 110
-        
+
+        # [제안 #2·#3] 화면 인식 신뢰도 (환경 설정창에서 조정)
+        self.generating_confidence = GENERATING_CONFIDENCE
+        self.ready_confidence = READY_CONFIDENCE
+        self.limit_confidence = LIMIT_CONFIDENCE
+
         self.last_status_msg = ""
         self.status_messages = DEFAULT_MESSAGES.copy()
         self.smart_prompt = SMART_PROMPT
@@ -657,9 +717,13 @@ class ClaudeWorker(QThread):
         claude_win = self.get_claude_window()
         is_claude_open = claude_win is not None
 
+        # [제안 #1] 이번 주기에 쓸 화면을 한 번만 캡처해 모든 템플릿 매칭에 재사용한다.
+        #           (창마다 generating*·limit_warning*·ready* 여러 장을 매번 새로 캡처하던 비용 제거)
+        frame = self._grab_window_frame(claude_win) if is_claude_open else None
+
         # [개선] 1. 창이 열려있고 이미 대기(WAITING) 중인 상태가 아니라면, 한도 초과 여부부터 최우선 검사
         if is_claude_open and self.state != State.WAITING:
-            is_limited = self._check_for_rate_limit(claude_win)
+            is_limited = self._check_for_rate_limit(claude_win, frame)
             if is_limited:
                 self._log_status_change()
                 return
@@ -670,9 +734,9 @@ class ClaudeWorker(QThread):
         is_generating = False
         done_confirmed = True
         if is_claude_open and self.state in (State.MONITORING, State.GENERATING):
-            is_generating = self._check_is_generating(claude_win)
+            is_generating = self._check_is_generating(claude_win, frame)
             if not is_generating and self._has_ready_templates():
-                done_confirmed = self._check_is_ready(claude_win)
+                done_confirmed = self._check_is_ready(claude_win, frame)
 
         self._log_status_change()
 
@@ -756,49 +820,78 @@ class ClaudeWorker(QThread):
         except Exception:
             return None
 
-    # [수정] 흑백(grayscale) 설정을 선택할 수 있도록 파라미터 추가
-    def _locate(self, img_path, win, confidence, use_grayscale=False):
+    def _grab_window_frame(self, win):
+        """[제안 #1] 창 영역을 1회 캡처해 (PIL 이미지, 원점 left, 원점 top)을 돌려준다.
+        캡처에 실패하면 None을 돌려줘 호출부가 기존 locateOnScreen 경로로 자연스럽게 폴백한다."""
         region = self._window_region(win)
         try:
+            if region:
+                left, top, _w, _h = region
+                return (pyautogui.screenshot(region=region), left, top)
+            return (pyautogui.screenshot(), 0, 0)
+        except Exception as e:
+            logging.debug(f"주기 화면 캡처 실패(개별 매칭으로 폴백): {e}")
+            return None
+
+    # [수정] 흑백(grayscale) 설정 + 주기당 캡처 재사용(frame) 파라미터 추가
+    def _locate(self, img_path, win, confidence, use_grayscale=False, frame=None):
+        try:
+            if frame is not None:
+                # [제안 #1] 이미 캡처해 둔 화면(haystack)에서 needle을 찾고,
+                #           반환 좌표를 창 원점만큼 더해 절대 화면 좌표로 환산한다.
+                shot, origin_x, origin_y = frame
+                box = pyautogui.locate(img_path, shot, confidence=confidence, grayscale=use_grayscale)
+                if box is None:
+                    return None
+                return ScreenBox(int(box.left) + origin_x, int(box.top) + origin_y,
+                                 int(box.width), int(box.height))
+            region = self._window_region(win)
             if region:
                 return pyautogui.locateOnScreen(img_path, confidence=confidence, region=region, grayscale=use_grayscale)
             return pyautogui.locateOnScreen(img_path, confidence=confidence, grayscale=use_grayscale)
         except Exception:
             return None
 
-    def _locate_rate_limit(self, claude_win):
+    def _locate_rate_limit(self, claude_win, frame=None):
         """한도 초과 이미지가 화면에 있으면 (pos, 파일명), 없으면 (None, None). 부작용 없음."""
         for img_path in glob.glob(resource_path("limit_warning*.png")):
-            # 오탐지를 원천 차단하기 위해 흑백 인식을 끄고(컬러 비교), 신뢰도(confidence)를 0.9로 상향
-            pos = self._locate(img_path, claude_win, confidence=0.9, use_grayscale=False)
+            # 오탐지를 원천 차단하기 위해 흑백 인식을 끄고(컬러 비교), 신뢰도를 엄격하게(기본 0.9) 둔다.
+            pos = self._locate(img_path, claude_win, confidence=self.limit_confidence,
+                               use_grayscale=False, frame=frame)
             if pos:
                 return pos, os.path.basename(img_path)
         return None, None
 
-    def _check_for_rate_limit(self, claude_win):
-        pos, img_name = self._locate_rate_limit(claude_win)
+    def _check_for_rate_limit(self, claude_win, frame=None):
+        pos, img_name = self._locate_rate_limit(claude_win, frame)
         if pos:
             logging.info(f"사용량 한도 도달 화면이 감지되었습니다! ({img_name}) OCR로 시간을 판독합니다.")
             self._setup_wait_timer(claude_win, pos)
             return True
         return False
 
-    def _match_any(self, prefix: str, claude_win) -> bool:
+    def _match_any(self, prefix: str, claude_win, base_conf: float, frame=None) -> bool:
         """resource의 <prefix>*.png 중 하나라도 화면에서 찾으면 True.
-        흑백 0.8 → 흑백 0.7 → 컬러 0.72 순으로 단계적으로 시도해 UI/배율 차이에 견딘다."""
+        흑백(base) → 흑백(base-0.10) → 컬러(base-0.08) 순으로 단계적으로 시도해 UI/배율 차이에 견딘다.
+        (base_conf=0.8이면 기존과 동일한 0.8 → 0.70 → 0.72 사다리)"""
+        ladder = (
+            (True, base_conf),
+            (True, max(0.40, round(base_conf - 0.10, 2))),
+            (False, max(0.40, round(base_conf - 0.08, 2))),
+        )
         for img_path in glob.glob(resource_path(prefix + "*.png")):
-            for use_gray, conf in ((True, CONFIDENCE_LEVEL), (True, 0.70), (False, 0.72)):
-                if self._locate(img_path, claude_win, conf, use_grayscale=use_gray) is not None:
+            for use_gray, conf in ladder:
+                if self._locate(img_path, claude_win, conf, use_grayscale=use_gray, frame=frame) is not None:
                     return True
         return False
 
-    def _check_is_generating(self, claude_win):
+    def _check_is_generating(self, claude_win, frame=None):
         # 생성 중 = 정지 버튼(■, generating*.png) 이 보임
-        return self._match_any("generating", claude_win)
+        return self._match_any("generating", claude_win, self.generating_confidence, frame)
 
-    def _check_is_ready(self, claude_win):
+    def _check_is_ready(self, claude_win, frame=None):
         # 완료/입력 대기 = 전송 버튼(↵, ready*.png) 이 보임
-        return self._match_any("ready", claude_win)
+        return self._match_any("ready", claude_win, self.ready_confidence, frame)
 
     @staticmethod
     def _has_ready_templates() -> bool:
@@ -840,7 +933,9 @@ class ClaudeWorker(QThread):
             return False
 
     def _notify_stable(self, claude_win):
-        """정지 시 Claude 창을 캡처해 텔레그램으로 보낸다 (설정 있을 때만)."""
+        """정지 시 Claude 창을 캡처해 텔레그램으로 보낸다 (설정 있을 때만).
+        [제안 #4] 캡처 이미지에 더해, 거기서 OCR로 추출한 '백로그 텍스트'도 함께 동봉해
+        모바일에서 이미지를 확대하지 않고도 백로그 내용을 바로 읽을 수 있게 한다."""
         try:
             region = self._window_region(claude_win)
             shot = pyautogui.screenshot(region=region) if region else pyautogui.screenshot()
@@ -848,8 +943,34 @@ class ClaudeWorker(QThread):
             shot.save(tmp_path)
             caption = f"[Auto-Pilot] 계획 안정 — 정지됨 ({datetime.datetime.now():%Y-%m-%d %H:%M})"
             send_telegram_photo(tmp_path, caption)
+            # 같은 캡처를 재사용해 백로그 텍스트를 뽑아 별도 메시지로 동봉(캡션 1024자 제한 회피).
+            backlog_text = self._extract_backlog_text(shot)
+            if backlog_text:
+                send_telegram_text("[Auto-Pilot] 📋 백로그\n" + backlog_text[:3500])
         except Exception as e:
             logging.error(f"정지 알림 처리 실패: {e}")
+
+    def _extract_backlog_text(self, screenshot) -> str:
+        """[제안 #4] 정지 캡처 이미지에서 백로그로 보이는 텍스트를 OCR로 추출한다.
+        OCR 불가/실패 시 빈 문자열을 돌려줘 알림은 이미지만 전송된다(기존 동작 유지)."""
+        global HAS_OCR, ocr_reader
+        if not HAS_OCR or screenshot is None:
+            return ""
+        if ocr_reader is None:
+            try:
+                logging.info("OCR 엔진을 초기화하는 중입니다... (최초 1회)")
+                ocr_reader = easyocr.Reader(['ko', 'en'])
+            except Exception as e:
+                logging.error(f"OCR 엔진 초기화 실패: {e}")
+                HAS_OCR = False
+                return ""
+        try:
+            results = ocr_reader.readtext(np.array(screenshot))
+            lines = [t.strip() for _bbox, t, _p in results if t and t.strip()]
+            return "\n".join(lines).strip()
+        except Exception as e:
+            logging.debug(f"백로그 OCR 실패: {e}")
+            return ""
 
     def _setup_wait_timer(self, claude_win, limit_pos):
         global HAS_OCR, ocr_reader
@@ -1241,12 +1362,20 @@ class MainWindow(QMainWindow):
         logging.info(f"클릭 위치 오프셋이 {value}px 로 변경되었습니다.")
 
     def open_settings(self):
-        dialog = MessageSettingsDialog(self.worker.status_messages, self.worker.smart_prompt, self)
+        current_conf = {
+            "generating": self.worker.generating_confidence,
+            "ready": self.worker.ready_confidence,
+            "limit": self.worker.limit_confidence,
+        }
+        dialog = MessageSettingsDialog(self.worker.status_messages, self.worker.smart_prompt, current_conf, self)
         if dialog.exec():
-            new_messages, new_prompt = dialog.get_values()
+            new_messages, new_prompt, new_conf = dialog.get_values()
             self.worker.status_messages = new_messages
             self.worker.smart_prompt = new_prompt
-            logging.info("⚙️ 상황별 메시지 및 프롬프트 설정이 저장되었습니다.")
+            self.worker.generating_confidence = new_conf["generating"]
+            self.worker.ready_confidence = new_conf["ready"]
+            self.worker.limit_confidence = new_conf["limit"]
+            logging.info("⚙️ 상황별 메시지·프롬프트·화면 인식 신뢰도 설정이 저장되었습니다.")
 
     def open_telegram_settings(self):
         TelegramSettingsDialog(self).exec()
@@ -1282,7 +1411,9 @@ class MainWindow(QMainWindow):
         gui_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt="%H:%M:%S"))
         logger.addHandler(gui_handler)
         
-        file_handler = logging.FileHandler("app.log", encoding='utf-8')
+        # [완료] app.log 크기 기준 롤오버 — 2MB 도달 시 회전하고 백업 3개까지 보관해 무한 증식 방지
+        file_handler = logging.handlers.RotatingFileHandler(
+            "app.log", maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding='utf-8')
         file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
         logger.addHandler(file_handler)
 
