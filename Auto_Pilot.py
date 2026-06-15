@@ -70,7 +70,6 @@ STABLE_TOKEN = "LOOPSTABLE"   # 클래식 모드 종료 토큰
 GENERATING_CONFIDENCE      = 0.80
 READY_CONFIDENCE           = 0.80
 LIMIT_CONFIDENCE           = 0.90
-STEP_COMPLETE_CONFIDENCE   = 0.60   # 스텝 완료 이미지는 DPI 차이를 허용해 더 관대하게
 
 LOG_MAX_BYTES   = 2 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
@@ -1226,9 +1225,9 @@ class ClaudeWorker(QThread):
             logging.warning(f"⚠️ {prefix}*.png 템플릿이 없어 Step {n} 완료를 감지할 수 없습니다.")
             return False
         logging.info(f"🔍 Step {n} 완료 이미지 매칭 시도: {[os.path.basename(t) for t in templates]}")
-        result = self._match_any(prefix, claude_win, STEP_COMPLETE_CONFIDENCE, frame)
+        result = self._match_any(prefix, claude_win, self.ready_confidence, frame)
         if not result:
-            logging.info(f"⏳ Step {n} 완료 미감지 — 신뢰도 {STEP_COMPLETE_CONFIDENCE} 기준")
+            logging.info(f"⏳ Step {n} 완료 미감지 — 신뢰도 {self.ready_confidence} 기준")
         return result
 
     def _build_step_prompt(self, step_idx: int) -> str:
@@ -1737,6 +1736,15 @@ class MainWindow(QMainWindow):
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self._update_progress_label(1 if steps else 0)
+        # 감시 시작 시 Claude 창을 앞으로 가져와 Auto-Pilot에 가리지 않게 함
+        win = self.worker.get_claude_window()
+        if win:
+            try:
+                if win.isMinimized:
+                    win.restore()
+                win.activate()
+            except Exception:
+                pass
         self.worker.start()
 
     def stop_worker(self):
