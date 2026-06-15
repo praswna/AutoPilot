@@ -1501,7 +1501,8 @@ class MainWindow(QMainWindow):
         self.close()
 
     # ── 스텝 관리 ─────────────────────────────────────────
-    def add_step(self, text: str = ""):
+    def add_step(self, _checked=False, text: str = ""):
+        # clicked 시그널은 checked(bool)를 첫 인자로 보내므로 _checked로 흡수한다.
         idx    = len(self._step_items) + 1
         item   = StepItemWidget(idx, text, self._step_container)
         item.delete_requested.connect(self._remove_step)
