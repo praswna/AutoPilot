@@ -796,6 +796,7 @@ class ClaudeWorker(QThread):
     continuous_mode_changed  = pyqtSignal(bool)
     step_progress_signal     = pyqtSignal(int, int)   # (current 1-based, total)
     auto_paused_signal       = pyqtSignal(str)         # pause reason
+    all_steps_done_signal    = pyqtSignal()            # 모든 스텝 1회 완료 → 자동 정지
 
     def __init__(self):
         super().__init__()
@@ -1017,19 +1018,14 @@ class ClaudeWorker(QThread):
         """모든 스텝을 한 바퀴 완료했을 때 호출.
         연속 모드면 Step 1로 루프백해 자율 루프를 계속하고,
         아니면 감시만 유지한다."""
-        logging.info("🎉 모든 스텝이 완료되었습니다!")
-        if self.continuous_mode:
-            # 연속 루프 중 — 매 사이클 알림은 스팸이므로 로그만 남기고 Step 1로 루프백
-            with self._step_lock:
-                self.expected_step  = 1
-                self.continue_count = 0
-            self.step_progress_signal.emit(1, len(self.steps))
-            logging.info("🔁 Step 1부터 다시 루프를 시작합니다.")
-            self.state = State.RESUMING
-        else:
-            self._notify_all_done(claude_win)
-            self.continuous_mode_changed.emit(False)
-            self.state = State.MONITORING
+        logging.info("🎉 모든 스텝이 완료되었습니다! 스크린샷을 전송하고 감시를 종료합니다.")
+        # 완료 알림(스크린샷) 전송
+        self._notify_all_done(claude_win)
+        # 한 바퀴 완료 → 연속 모드 해제 후 워커를 정지시킨다.
+        self.continuous_mode = False
+        self.continuous_mode_changed.emit(False)
+        self.running = False          # run 루프 종료 → 스레드 자연 종료
+        self.all_steps_done_signal.emit()   # GUI가 버튼/잠금 상태를 정리
 
     def _handle_generation_done(self, claude_win, frame):
         """답변 완료 후 스텝 모드 / 클래식 모드로 분기.
@@ -1585,6 +1581,7 @@ class MainWindow(QMainWindow):
         self.worker.continuous_mode_changed.connect(self._sync_continuous_checkbox)
         self.worker.step_progress_signal.connect(self._on_step_progress)
         self.worker.auto_paused_signal.connect(self._on_auto_paused)
+        self.worker.all_steps_done_signal.connect(self._on_all_steps_done)
         self.setup_logging()
 
         # 스텝 관리 다이얼로그 — lbl_progress 등 모든 위젯 생성 후 여기서 초기화
@@ -1799,21 +1796,36 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def stop_worker(self):
+        self._teardown_run_resources()
+        self.worker.stop()
+        self.worker.wait()
+        self._reset_ui_after_stop()
+        logging.info("감시가 중지되었습니다.")
+
+    def _teardown_run_resources(self):
+        """F12 단축키·텔레그램 폴러 등 실행 중 자원을 해제한다."""
         if HAS_KEYBOARD:
             try:
                 _keyboard_lib.remove_hotkey('f12')
             except Exception:
                 pass
         self._stop_tg_poller()
-        self.worker.stop()
-        self.worker.wait()
+
+    def _reset_ui_after_stop(self):
+        """감시 종료 후 버튼·잠금·진행 표시를 초기 상태로 되돌린다."""
         self._lock_ui(False)
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_force_next.setEnabled(False)
         self._step_dlg.set_step_active(0, 0)
         self._update_progress_label()
-        logging.info("감시가 중지되었습니다.")
+
+    def _on_all_steps_done(self):
+        """워커가 한 바퀴 완료 후 스스로 정지할 때 호출 — 자원 해제 및 UI 정리."""
+        self._teardown_run_resources()
+        self.worker.wait()
+        self._reset_ui_after_stop()
+        logging.info("✅ 모든 스텝을 완료하여 감시를 종료했습니다.")
 
     def _emergency_stop_hotkey(self):
         """keyboard 라이브러리 콜백 — 워커 스레드에서 호출되므로 Qt 작업은 메인으로 마샬."""
