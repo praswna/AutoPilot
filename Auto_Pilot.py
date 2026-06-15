@@ -1888,7 +1888,12 @@ class MainWindow(QMainWindow):
                 pass
         if self.worker.isRunning():
             self.worker.stop()
-            self.worker.wait()
+            # 워커가 pyautogui 동작 중일 수 있으므로 타임아웃을 두고,
+            # 시간 내 종료 못 하면 강제 종료해 프로세스가 매달리지 않게 한다.
+            if not self.worker.wait(5000):
+                logging.warning("워커가 제때 종료되지 않아 강제 종료합니다.")
+                self.worker.terminate()
+                self.worker.wait()
         super().closeEvent(event)
 
 # ---------------------------------------------------------
