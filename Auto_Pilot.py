@@ -1415,7 +1415,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{VERSION}")
         self.setWindowIcon(app_icon())
-        self.resize(880, 680)
+        self.resize(820, 440)
         self._tg_poller: TelegramPollerThread | None = None
         self._screen_busy = False   # /screen 중복 캡처 방지 플래그
 
