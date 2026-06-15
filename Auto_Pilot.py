@@ -1110,9 +1110,12 @@ class ClaudeWorker(QThread):
         )
         for img_path in glob.glob(resource_path(prefix + "*.png")):
             for use_gray, conf in ladder:
-                if self._locate(img_path, claude_win, conf,
-                                use_grayscale=use_gray, frame=frame) is not None:
+                match = self._locate(img_path, claude_win, conf,
+                                     use_grayscale=use_gray, frame=frame)
+                if match is not None:
+                    logging.info(f"✅ 이미지 매칭 성공: {os.path.basename(img_path)} (신뢰도={conf}, gray={use_gray})")
                     return True
+        logging.info(f"❌ 이미지 매칭 실패: {prefix}*.png (신뢰도={base_conf}~{max(0.40, round(base_conf-0.10,2))})")
         return False
 
     def _check_is_generating(self, claude_win, frame=None):
@@ -1168,10 +1171,15 @@ class ClaudeWorker(QThread):
         """현재 expected_step의 완료를 step{N}_complete*.png 이미지 매칭으로만 감지한다."""
         n      = self.expected_step
         prefix = f"step{n}_complete"
-        if not glob.glob(resource_path(f"{prefix}*.png")):
+        templates = glob.glob(resource_path(f"{prefix}*.png"))
+        if not templates:
             logging.warning(f"⚠️ {prefix}*.png 템플릿이 없어 Step {n} 완료를 감지할 수 없습니다.")
             return False
-        return self._match_any(prefix, claude_win, self.ready_confidence, frame)
+        logging.info(f"🔍 Step {n} 완료 이미지 매칭 시도: {[os.path.basename(t) for t in templates]}")
+        result = self._match_any(prefix, claude_win, self.ready_confidence, frame)
+        if not result:
+            logging.info(f"⏳ Step {n} 완료 미감지 — 신뢰도 {self.ready_confidence} 기준")
+        return result
 
     def _build_step_prompt(self, step_idx: int) -> str:
         """스텝 프롬프트 끝에 완료 표식 지시어를 자동 합성한다 (step_idx: 0-based).
