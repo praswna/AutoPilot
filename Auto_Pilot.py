@@ -1588,6 +1588,19 @@ class MainWindow(QMainWindow):
         self.btn_collapse.clicked.connect(self.toggle_collapsed)
         collapse_row.addWidget(self.btn_collapse)
 
+        # 접힌 상태 전용 미니 체크박스 (메인 체크박스와 동기화)
+        self.cb_continuous_mini = QCheckBox("연속")
+        self.cb_continuous_mini.setToolTip("연속 작업 모드")
+        self.cb_continuous_mini.setVisible(False)
+        self.cb_continuous_mini.stateChanged.connect(self._on_continuous_mini)
+        collapse_row.addWidget(self.cb_continuous_mini)
+
+        self.cb_loop_forever_mini = QCheckBox("🔁 무한")
+        self.cb_loop_forever_mini.setToolTip("무한 반복 모드")
+        self.cb_loop_forever_mini.setVisible(False)
+        self.cb_loop_forever_mini.stateChanged.connect(self._on_loop_forever_mini)
+        collapse_row.addWidget(self.cb_loop_forever_mini)
+
         # 접힌 상태 전용 미니 시작/중지 버튼 (펼친 상태에서는 숨김)
         self.btn_start_mini = QPushButton("▶ 시작")
         self.btn_start_mini.setStyleSheet(
@@ -1984,13 +1997,26 @@ class MainWindow(QMainWindow):
 
     def toggle_continuous_mode(self, _):
         on = self.cb_continuous.isChecked()
+        self.cb_continuous_mini.blockSignals(True)
+        self.cb_continuous_mini.setChecked(on)
+        self.cb_continuous_mini.blockSignals(False)
         self.worker.continuous_mode = on
         logging.info(f"연속 작업 모드가 {'ON' if on else 'OFF'} 되었습니다.")
 
+    def _on_continuous_mini(self, _):
+        # 미니 체크박스 → 메인 체크박스로 위임 (메인 핸들러가 워커·동기화 처리)
+        self.cb_continuous.setChecked(self.cb_continuous_mini.isChecked())
+
     def toggle_loop_forever(self, _):
         on = self.cb_loop_forever.isChecked()
+        self.cb_loop_forever_mini.blockSignals(True)
+        self.cb_loop_forever_mini.setChecked(on)
+        self.cb_loop_forever_mini.blockSignals(False)
         self.worker.loop_forever = on
         logging.info(f"무한 반복 모드가 {'ON' if on else 'OFF'} 되었습니다.")
+
+    def _on_loop_forever_mini(self, _):
+        self.cb_loop_forever.setChecked(self.cb_loop_forever_mini.isChecked())
 
     def toggle_collapsed(self):
         """로그만 보이도록 접거나, 모든 컨트롤을 다시 펼친다."""
@@ -1998,9 +2024,11 @@ class MainWindow(QMainWindow):
         for w in (self._top_widget, self._offset_frame,
                   self._progress_widget, self._action_widget):
             w.setVisible(not self._collapsed)
-        # 접힌 상태에서는 펼치기 버튼 옆 미니 시작/중지 버튼을 노출
+        # 접힌 상태에서는 펼치기 버튼 옆 미니 시작/중지 버튼과 체크박스를 노출
         self.btn_start_mini.setVisible(self._collapsed)
         self.btn_stop_mini.setVisible(self._collapsed)
+        self.cb_continuous_mini.setVisible(self._collapsed)
+        self.cb_loop_forever_mini.setVisible(self._collapsed)
         if self._collapsed:
             self.btn_collapse.setText("🔼 펼치기")
             # 접힌 상태에서 창을 작게 줄일 수 있도록 최소 크기 제한 완화
