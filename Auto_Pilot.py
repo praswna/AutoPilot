@@ -1430,10 +1430,6 @@ class MainWindow(QMainWindow):
         self._step_scroll.setWidget(self._step_container)
         sg_layout.addWidget(self._step_scroll)
 
-        # 기본 스텝 (스마트 프롬프트의 4개 STEP) 자동 삽입
-        for default_text in DEFAULT_STEPS:
-            self.add_step(text=default_text)
-
         # 하단 컨트롤
         step_ctrl = QHBoxLayout()
         self.btn_add_step = QPushButton("+ 스텝 추가")
@@ -1509,6 +1505,10 @@ class MainWindow(QMainWindow):
         self.worker.auto_paused_signal.connect(self._on_auto_paused)
         self.setup_logging()
         self.setup_tray()
+
+        # 기본 스텝 삽입 — lbl_progress 등 모든 위젯 생성 후 여기서 실행
+        for default_text in DEFAULT_STEPS:
+            self.add_step(text=default_text)
 
         screen_geom = QApplication.primaryScreen().availableGeometry()
         self.move(screen_geom.right() - self.width() - 10,
