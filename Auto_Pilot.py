@@ -446,10 +446,11 @@ class TelegramSettingsDialog(QDialog):
         "&nbsp;&nbsp;/status — 현재 상태 조회<br>"
         "&nbsp;&nbsp;/screen — 현재 화면 캡처 전송<br>"
         "&nbsp;&nbsp;/send [메시지] — 클로드에 직접 메시지 전송<br>"
-        "&nbsp;&nbsp;/stop — 감시 중지<br>"
         "&nbsp;&nbsp;/pause — 연속 모드 중단<br>"
         "&nbsp;&nbsp;/resume — 연속 모드 재개<br>"
-        "&nbsp;&nbsp;/next — 강제 다음 스텝<br><br>"
+        "&nbsp;&nbsp;/next — 강제 다음 스텝<br>"
+        "&nbsp;&nbsp;/stop — 감시 중지<br>"
+        "&nbsp;&nbsp;/help — 명령어 목록 표시<br><br>"
         "<i>※ chat id 가 일치하는 본인 대화만 명령을 처리하며,<br>"
         "&nbsp;&nbsp;&nbsp;전송된 지 30초가 지난 명령은 자동 폐기됩니다.<br>"
         "&nbsp;&nbsp;&nbsp;봇 토큰은 외부에 공유하지 마세요.</i>"
@@ -1666,9 +1667,25 @@ class MainWindow(QMainWindow):
                 # 워커 스레드가 다음 루프에서 클로드에 붙여넣어 전송 (충돌 방지)
                 self.worker.queue_message(arg)
                 reply(f"[Auto-Pilot] 📨 메시지를 전송 큐에 넣었습니다:\n{arg[:200]}")
+        elif cmd == "/help":
+            reply(
+                "[Auto-Pilot] 📋 명령어 목록\n"
+                "\n"
+                "/status — 현재 상태 조회\n"
+                "/screen — PC 화면 캡처 전송\n"
+                "/send [메시지] — 클로드에 직접 메시지 전송\n"
+                "/pause — 연속 모드 OFF (자동 진행 멈춤)\n"
+                "/resume — 연속 모드 ON / PAUSED 재개\n"
+                "/next — 강제 다음 스텝으로 넘김\n"
+                "/stop — 감시 완전 중지\n"
+                "/help — 이 명령어 목록 표시\n"
+                "\n"
+                "※ 감시 시작 후에만 명령이 동작합니다.\n"
+                "※ 30초 지난 명령은 자동 폐기됩니다."
+            )
         else:
             reply(f"[Auto-Pilot] 알 수 없는 명령: {cmd}\n"
-                  f"사용 가능: /status /screen /send /stop /pause /resume /next")
+                  f"/help 로 명령어 목록을 확인하세요.")
         logging.info(f"📨 텔레그램 명령 수신: {cmd}")
 
     def _send_screen_capture(self):
