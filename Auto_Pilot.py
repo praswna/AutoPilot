@@ -85,6 +85,7 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 TELEGRAM_CONFIG_PATH = os.path.join(APP_DIR, "telegram_config.json")
 STEPS_CONFIG_PATH    = os.path.join(APP_DIR, "steps.json")
+WINDOW_CONFIG_PATH   = os.path.join(APP_DIR, "window_config.json")
 
 # 클래식 모드용 스마트 프롬프트 (스텝 목록이 없을 때 사용)
 SMART_PROMPT = """[중요 지시사항: 아래 판단 흐름에 따라 현재 상황에 맞는 **단 하나의 STEP만** 실행할 것. 절대 여러 STEP을 한 번에 섞어서 실행하지 마라.]
@@ -226,18 +227,44 @@ def save_steps(steps: list[str]) -> bool:
         return False
 
 def load_steps() -> list[str] | None:
-    """steps.json에서 스텝 텍스트 목록을 복원한다. 없으면 None."""
+    """steps.json에서 스텝 텍스트 목록을 복원한다. 없으면 None.
+    APP_DIR(실행 파일 옆)을 먼저 보고, 없으면 번들된 기본 steps.json을 사용한다."""
+    for path in (STEPS_CONFIG_PATH, resource_path("steps.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            logging.warning(f"스텝 읽기 실패({path}): {e}")
+            continue
+        steps = data.get("steps")
+        if isinstance(steps, list):
+            return [str(s) for s in steps]
+    return None
+
+def save_window_geometry(x: int, y: int, w: int, h: int) -> bool:
+    """메인 창 위치·크기를 window_config.json에 저장한다."""
     try:
-        with open(STEPS_CONFIG_PATH, "r", encoding="utf-8") as f:
+        with open(WINDOW_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"x": x, "y": y, "w": w, "h": h}, f)
+        return True
+    except Exception as e:
+        logging.debug(f"창 위치 저장 실패: {e}")
+        return False
+
+def load_window_geometry() -> dict | None:
+    """저장된 메인 창 위치·크기를 복원한다. 없으면 None."""
+    try:
+        with open(WINDOW_CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
         return None
     except Exception as e:
-        logging.warning(f"스텝 읽기 실패: {e}")
+        logging.debug(f"창 위치 읽기 실패: {e}")
         return None
-    steps = data.get("steps")
-    if isinstance(steps, list):
-        return [str(s) for s in steps]
+    if all(k in data for k in ("x", "y", "w", "h")):
+        return data
     return None
 
 # ---------------------------------------------------------
@@ -1599,9 +1626,15 @@ class MainWindow(QMainWindow):
             self._step_dlg.add_step(text=step_text)
         self._update_progress_label()
 
-        screen_geom = QApplication.primaryScreen().availableGeometry()
-        self.move(screen_geom.right() - self.width() - 10,
-                  screen_geom.bottom() - self.height() - 50)
+        # 저장된 창 위치·크기 복원 — 없으면 우측 하단에 배치
+        geom = load_window_geometry()
+        if geom:
+            self.resize(geom["w"], geom["h"])
+            self.move(geom["x"], geom["y"])
+        else:
+            screen_geom = QApplication.primaryScreen().availableGeometry()
+            self.move(screen_geom.right() - self.width() - 10,
+                      screen_geom.bottom() - self.height() - 50)
 
 
     # ── 스텝 관리 ─────────────────────────────────────────
@@ -1944,8 +1977,9 @@ class MainWindow(QMainWindow):
         self.toast.show()
 
     def closeEvent(self, event):
-        # 종료 시 현재 스텝을 저장해 다음 실행에 복원한다.
+        # 종료 시 현재 스텝과 창 위치·크기를 저장해 다음 실행에 복원한다.
         save_steps([item.get_text() for item in self._step_dlg._step_items])
+        save_window_geometry(self.x(), self.y(), self.width(), self.height())
         self._stop_tg_poller()
         if HAS_KEYBOARD:
             try:
