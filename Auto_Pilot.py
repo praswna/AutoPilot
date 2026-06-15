@@ -943,8 +943,10 @@ class ClaudeWorker(QThread):
             self.state = State.MONITORING
 
     def _handle_generation_done(self, claude_win, frame):
-        """답변 완료 후 스텝 모드 / 클래식 모드로 분기."""
-        if self.continuous_mode and self.steps:
+        """답변 완료 후 스텝 모드 / 클래식 모드로 분기.
+        스텝 목록이 있으면 continuous_mode와 무관하게 항상 스텝 모드로 동작한다.
+        자동 전진(RESUMING)은 continuous_mode가 True일 때만 수행한다."""
+        if self.steps:
             step_done = self._check_step_complete(claude_win, frame)
             if step_done:
                 logging.info(f"✅ Step {self.expected_step}/{len(self.steps)} 완료 확인!")
@@ -958,8 +960,10 @@ class ClaudeWorker(QThread):
                     self.continuous_mode_changed.emit(False)
                     self._notify_all_done(claude_win)
                     self.state = State.MONITORING
-                else:
+                elif self.continuous_mode:
                     self.state = State.RESUMING
+                else:
+                    self.state = State.MONITORING
             else:
                 with self._step_lock:
                     self.continue_count += 1
@@ -971,8 +975,10 @@ class ClaudeWorker(QThread):
                     logging.warning(f"⚠️ 자동 일시 정지 — {self._pause_reason}")
                     self.state = State.PAUSED
                     self.auto_paused_signal.emit(self._pause_reason)
-                else:
+                elif self.continuous_mode:
                     self.state = State.RESUMING  # "계속 이어서 작성해 줘" 전송
+                else:
+                    self.state = State.MONITORING
 
         elif self.continuous_mode:
             # 클래식 모드
@@ -1279,7 +1285,7 @@ class ClaudeWorker(QThread):
 
         # 스텝 모드인 경우 전송할 텍스트를 미리 결정
         step_prompt: str | None = None
-        if self.steps and self.continuous_mode:
+        if self.steps:
             step_idx = self.expected_step - 1
             if self.continue_count > 0:
                 step_prompt = "계속 이어서 작성해 줘"
