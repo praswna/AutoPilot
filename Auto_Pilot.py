@@ -67,9 +67,10 @@ MAX_CONTINUE_DEFAULT = 3       # 최대 "계속" 횟수 기본값
 
 STABLE_TOKEN = "LOOPSTABLE"   # 클래식 모드 종료 토큰
 
-GENERATING_CONFIDENCE = 0.80
-READY_CONFIDENCE      = 0.80
-LIMIT_CONFIDENCE      = 0.90
+GENERATING_CONFIDENCE      = 0.80
+READY_CONFIDENCE           = 0.80
+LIMIT_CONFIDENCE           = 0.90
+STEP_COMPLETE_CONFIDENCE   = 0.60   # 스텝 완료 이미지는 DPI 차이를 허용해 더 관대하게
 
 LOG_MAX_BYTES   = 2 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
@@ -1146,9 +1147,9 @@ class ClaudeWorker(QThread):
             logging.warning(f"⚠️ {prefix}*.png 템플릿이 없어 Step {n} 완료를 감지할 수 없습니다.")
             return False
         logging.info(f"🔍 Step {n} 완료 이미지 매칭 시도: {[os.path.basename(t) for t in templates]}")
-        result = self._match_any(prefix, claude_win, self.ready_confidence, frame)
+        result = self._match_any(prefix, claude_win, STEP_COMPLETE_CONFIDENCE, frame)
         if not result:
-            logging.info(f"⏳ Step {n} 완료 미감지 — 신뢰도 {self.ready_confidence} 기준")
+            logging.info(f"⏳ Step {n} 완료 미감지 — 신뢰도 {STEP_COMPLETE_CONFIDENCE} 기준")
         return result
 
     def _build_step_prompt(self, step_idx: int) -> str:
