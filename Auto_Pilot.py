@@ -74,6 +74,9 @@ LIMIT_CONFIDENCE      = 0.90
 LOG_MAX_BYTES   = 2 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 
+TELEGRAM_POLL_INTERVAL = 5      # getUpdates 폴링 주기(초)
+TELEGRAM_CMD_TTL       = 30     # 명령 유효 시간(초) — 이보다 오래된 명령은 폐기
+
 ScreenBox = namedtuple("ScreenBox", "left top width height")
 
 if getattr(sys, "frozen", False):
@@ -403,11 +406,14 @@ class TelegramSettingsDialog(QDialog):
         "<b>② chat id</b>: 봇에게 아무 메시지 전송 후 @userinfobot 으로 확인<br><br>"
         "<b>명령어 목록</b> (양방향 사용 시):<br>"
         "&nbsp;&nbsp;/status — 현재 상태 조회<br>"
+        "&nbsp;&nbsp;/screen — 현재 화면 캡처 전송<br>"
         "&nbsp;&nbsp;/stop — 감시 중지<br>"
         "&nbsp;&nbsp;/pause — 연속 모드 중단<br>"
         "&nbsp;&nbsp;/resume — 연속 모드 재개<br>"
         "&nbsp;&nbsp;/next — 강제 다음 스텝<br><br>"
-        "<i>※ 봇 토큰은 외부에 공유하지 마세요.</i>"
+        "<i>※ chat id 가 일치하는 본인 대화만 명령을 처리하며,<br>"
+        "&nbsp;&nbsp;&nbsp;전송된 지 30초가 지난 명령은 자동 폐기됩니다.<br>"
+        "&nbsp;&nbsp;&nbsp;봇 토큰은 외부에 공유하지 마세요.</i>"
     )
 
     def __init__(self, parent=None):
@@ -525,14 +531,18 @@ class TelegramPollerThread(QThread):
                     msg  = upd.get("message", {})
                     text = msg.get("text", "").strip()
                     chat_id = str(msg.get("chat", {}).get("id", ""))
-                    # chat_id 필터: 설정된 대화에서 보낸 명령만 처리
+                    # chat_id 필터(보안) + 만료 필터(오래된 명령 폭주 방지)
                     if text.startswith("/") and chat_id == self.chat_id:
-                        self.command_received.emit(text.split()[0])
+                        age = time.time() - msg.get("date", 0)
+                        if age <= TELEGRAM_CMD_TTL:
+                            self.command_received.emit(text.split()[0])
+                        else:
+                            logging.info(f"⏰ 만료된 텔레그램 명령 무시 ({int(age)}초 경과): {text.split()[0]}")
                     if uid > self._last_update_id:
                         self._last_update_id = uid
             except Exception as e:
                 logging.debug(f"텔레그램 폴링 오류: {e}")
-            self._sleep(5)
+            self._sleep(TELEGRAM_POLL_INTERVAL)
 
     def stop(self):
         self.running = False
@@ -1568,10 +1578,35 @@ class MainWindow(QMainWindow):
             next_n = min(self.worker.expected_step + 1, len(self.worker.steps) + 1) if self.worker.steps else 1
             QTimer.singleShot(0, self._on_force_next)
             reply(f"[Auto-Pilot] 강제 다음 스텝 → Step {next_n}")
+        elif cmd == "/screen":
+            reply("[Auto-Pilot] 📸 현재 화면을 캡처해 전송합니다…")
+            # 캡처+업로드는 GUI를 막지 않도록 데몬 스레드에서 처리
+            threading.Thread(target=self._send_screen_capture, daemon=True).start()
         else:
             reply(f"[Auto-Pilot] 알 수 없는 명령: {cmd}\n"
-                  f"사용 가능: /status /stop /pause /resume /next")
+                  f"사용 가능: /status /screen /stop /pause /resume /next")
         logging.info(f"📨 텔레그램 명령 수신: {cmd}")
+
+    def _send_screen_capture(self):
+        """현재 전체 화면을 캡처해 텔레그램으로 전송 (데몬 스레드에서 호출)."""
+        tmp = None
+        try:
+            shot = pyautogui.screenshot()
+            tmp  = os.path.join(tempfile.gettempdir(),
+                                f"autopilot_screen_{int(time.time())}.png")
+            shot.save(tmp)
+            caption = f"[Auto-Pilot] 🖥 화면 캡처 ({datetime.datetime.now():%Y-%m-%d %H:%M:%S})"
+            if not send_telegram_photo(tmp, caption):
+                send_telegram_text("[Auto-Pilot] 화면 전송에 실패했습니다.")
+        except Exception as e:
+            logging.error(f"화면 캡처 전송 실패: {e}")
+            send_telegram_text(f"[Auto-Pilot] 화면 캡처 실패: {e}")
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
     # ── 감시 시작/중지 ────────────────────────────────────
     def start_worker(self):
