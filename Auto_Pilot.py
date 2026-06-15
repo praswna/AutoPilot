@@ -719,7 +719,8 @@ class ClaudeWorker(QThread):
 
         # [제안 #1] 이번 주기에 쓸 화면을 한 번만 캡처해 모든 템플릿 매칭에 재사용한다.
         #           (창마다 generating*·limit_warning*·ready* 여러 장을 매번 새로 캡처하던 비용 제거)
-        frame = self._grab_window_frame(claude_win) if is_claude_open else None
+        #           WAITING 단계는 아래에서 frame을 쓰지 않으므로 캡처 자체를 건너뛴다.
+        frame = self._grab_window_frame(claude_win) if (is_claude_open and self.state != State.WAITING) else None
 
         # [개선] 1. 창이 열려있고 이미 대기(WAITING) 중인 상태가 아니라면, 한도 초과 여부부터 최우선 검사
         if is_claude_open and self.state != State.WAITING:
@@ -897,20 +898,28 @@ class ClaudeWorker(QThread):
     def _has_ready_templates() -> bool:
         return bool(glob.glob(resource_path("ready*.png")))
 
-    def _check_loop_stable(self, claude_win) -> bool:
-        """입력창 바로 위(=응답 마지막 줄) 영역을 OCR해 STABLE_TOKEN이 있으면 True.
-        OCR 불가 시에는 항상 False (자동 정지하지 않음)."""
+    @staticmethod
+    def _ensure_ocr() -> bool:
+        """easyocr Reader를 지연 초기화한다. 사용 가능하면 True, 불가/실패면 False.
+        초기화에 실패하면 HAS_OCR을 꺼 이후 호출이 즉시 False를 반환하게 한다."""
         global HAS_OCR, ocr_reader
-        if not HAS_OCR or claude_win is None:
+        if not HAS_OCR:
             return False
         if ocr_reader is None:
             try:
-                logging.info("OCR 엔진을 초기화하는 중입니다... (최초 1회)")
+                logging.info("OCR 엔진을 초기화하는 중입니다... (최초 1회만 실행되며 약간의 시간이 소요될 수 있습니다)")
                 ocr_reader = easyocr.Reader(['ko', 'en'])
             except Exception as e:
                 logging.error(f"OCR 엔진 초기화 실패: {e}")
                 HAS_OCR = False
                 return False
+        return True
+
+    def _check_loop_stable(self, claude_win) -> bool:
+        """입력창 바로 위(=응답 마지막 줄) 영역을 OCR해 STABLE_TOKEN이 있으면 True.
+        OCR 불가 시에는 항상 False (자동 정지하지 않음)."""
+        if claude_win is None or not self._ensure_ocr():
+            return False
         try:
             # 입력창 클릭 지점(win.bottom - click_y_offset) 위쪽을 넉넉히 캡처
             # (응답 마지막 줄 위치가 입력창 높이·여백에 따라 달라질 수 있어 띠를 크게 잡음)
@@ -936,6 +945,9 @@ class ClaudeWorker(QThread):
         """정지 시 Claude 창을 캡처해 텔레그램으로 보낸다 (설정 있을 때만).
         [제안 #4] 캡처 이미지에 더해, 거기서 OCR로 추출한 '백로그 텍스트'도 함께 동봉해
         모바일에서 이미지를 확대하지 않고도 백로그 내용을 바로 읽을 수 있게 한다."""
+        # 텔레그램이 설정되지 않았으면 캡처/OCR 비용을 들이지 않고 즉시 종료한다.
+        if not load_telegram_config():
+            return
         try:
             region = self._window_region(claude_win)
             shot = pyautogui.screenshot(region=region) if region else pyautogui.screenshot()
@@ -953,17 +965,8 @@ class ClaudeWorker(QThread):
     def _extract_backlog_text(self, screenshot) -> str:
         """[제안 #4] 정지 캡처 이미지에서 백로그로 보이는 텍스트를 OCR로 추출한다.
         OCR 불가/실패 시 빈 문자열을 돌려줘 알림은 이미지만 전송된다(기존 동작 유지)."""
-        global HAS_OCR, ocr_reader
-        if not HAS_OCR or screenshot is None:
+        if screenshot is None or not self._ensure_ocr():
             return ""
-        if ocr_reader is None:
-            try:
-                logging.info("OCR 엔진을 초기화하는 중입니다... (최초 1회)")
-                ocr_reader = easyocr.Reader(['ko', 'en'])
-            except Exception as e:
-                logging.error(f"OCR 엔진 초기화 실패: {e}")
-                HAS_OCR = False
-                return ""
         try:
             results = ocr_reader.readtext(np.array(screenshot))
             lines = [t.strip() for _bbox, t, _p in results if t and t.strip()]
@@ -973,24 +976,13 @@ class ClaudeWorker(QThread):
             return ""
 
     def _setup_wait_timer(self, claude_win, limit_pos):
-        global HAS_OCR, ocr_reader
-        
-        if not HAS_OCR:
-            logging.error("easyocr 패키지가 설치되지 않아 OCR을 사용할 수 없습니다. (명령어: pip install easyocr numpy)")
+        # OCR을 쓸 수 없으면(미설치/초기화 실패) 시간 판독을 포기하고 안전 대기 시간을 적용한다.
+        if not self._ensure_ocr():
+            logging.error("easyocr를 사용할 수 없어 OCR 시간 판독을 건너뜁니다. (필요 시: pip install easyocr numpy)")
             logging.info(f"안전 대기 시간({FALLBACK_WAIT_MINUTES}분) 적용...")
             self.target_time = datetime.datetime.now() + datetime.timedelta(minutes=FALLBACK_WAIT_MINUTES)
             self.state = State.WAITING
             return
-
-        if ocr_reader is None:
-            logging.info("OCR 엔진을 초기화하는 중입니다... (최초 1회만 실행되며 약간의 시간이 소요될 수 있습니다)")
-            try:
-                # 한국어, 영어 지원 Reader 생성
-                ocr_reader = easyocr.Reader(['ko', 'en'])
-            except Exception as e:
-                logging.error(f"OCR 엔진 초기화 실패: {e}")
-                HAS_OCR = False
-                return self._setup_wait_timer(claude_win, limit_pos) # 재귀 호출로 안전 대기 시간 적용
 
         # [변경] 마우스 클릭/클립보드 복사를 완전히 제거하고 화면 캡처 OCR로 교체
         # limit_pos(한도초과 아이콘 위치)를 기준으로 우측으로 500px, 상하로 약간 여유를 두고 캡처 영역 설정
