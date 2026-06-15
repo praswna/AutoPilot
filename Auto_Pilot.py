@@ -683,7 +683,86 @@ class StepItemWidget(QFrame):
             self.lbl_num.setStyleSheet("font-weight: bold; color: #8be9fd;")
 
 # ---------------------------------------------------------
-# 12. 오토파일럿 워커 스레드
+# 12. 스텝 관리 다이얼로그
+# ---------------------------------------------------------
+class StepManagerDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📋 스텝 관리")
+        self.resize(500, 480)
+        self._step_items: list[StepItemWidget] = []
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        # 스크롤 영역
+        self._step_scroll = QScrollArea()
+        self._step_scroll.setWidgetResizable(True)
+        self._step_scroll.setStyleSheet(
+            "QScrollArea { border:1px solid #3c3c3c; background:#1a1a1a; }"
+        )
+        self._step_container = QWidget()
+        self._step_layout    = QVBoxLayout(self._step_container)
+        self._step_layout.setSpacing(4)
+        self._step_layout.addStretch()
+        self._step_scroll.setWidget(self._step_container)
+        layout.addWidget(self._step_scroll, stretch=1)
+
+        # 하단 컨트롤
+        step_ctrl = QHBoxLayout()
+        self.btn_add_step = QPushButton("+ 스텝 추가")
+        self.btn_add_step.setStyleSheet(
+            "QPushButton { background:#27ae60; color:white; font-weight:bold;"
+            " padding:4px 14px; border-radius:4px; }"
+            "QPushButton:hover { background:#2ecc71; }"
+        )
+        self.btn_add_step.clicked.connect(self.add_step)
+        step_ctrl.addWidget(self.btn_add_step)
+        step_ctrl.addStretch()
+        layout.addLayout(step_ctrl)
+
+    def closeEvent(self, event):
+        self.hide()
+        event.ignore()
+
+    def add_step(self, _checked=False, text: str = ""):
+        idx  = len(self._step_items) + 1
+        item = StepItemWidget(idx, text, self._step_container)
+        item.delete_requested.connect(self._remove_step)
+        count = self._step_layout.count()
+        self._step_layout.insertWidget(count - 1, item)
+        self._step_items.append(item)
+        self._update_step_labels()
+
+    def _remove_step(self, item: StepItemWidget):
+        if item in self._step_items:
+            self._step_items.remove(item)
+            self._step_layout.removeWidget(item)
+            item.deleteLater()
+            self._update_step_labels()
+
+    def _update_step_labels(self):
+        for i, item in enumerate(self._step_items, start=1):
+            item.set_index(i)
+
+    def get_steps(self) -> list[str]:
+        return [item.get_text().strip()
+                for item in self._step_items
+                if item.get_text().strip()]
+
+    def set_locked(self, locked: bool):
+        self.btn_add_step.setEnabled(not locked)
+        for item in self._step_items:
+            item.set_locked(locked)
+
+    def set_step_active(self, current: int, total: int):
+        for i, item in enumerate(self._step_items, start=1):
+            item.set_active(i == current, done=(i < current))
+
+
+# ---------------------------------------------------------
+# 13. 오토파일럿 워커 스레드
 # ---------------------------------------------------------
 class ClaudeWorker(QThread):
     toast_signal             = pyqtSignal(str)
@@ -1309,7 +1388,7 @@ class ClaudeWorker(QThread):
         self._interruptible_sleep(5.0)
 
 # ---------------------------------------------------------
-# 13. 메인 GUI 창
+# 14. 메인 GUI 창
 # ---------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1318,7 +1397,6 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(app_icon())
         self.resize(880, 680)
         self._tg_poller: TelegramPollerThread | None = None
-        self._step_items: list[StepItemWidget] = []
         self._screen_busy = False   # /screen 중복 캡처 방지 플래그
 
         central = QWidget()
@@ -1384,47 +1462,25 @@ class MainWindow(QMainWindow):
         btn_test.clicked.connect(self.test_click_position)
         ofl.addWidget(btn_test)
         ofl.addStretch()
+
+        # ── 스텝 관리 버튼 + 진행 상황 라벨 ─────────────
+        btn_step_mgr = QPushButton("📋 스텝 관리")
+        btn_step_mgr.setStyleSheet(
+            "QPushButton { background-color:#2980b9; color:white; font-weight:bold;"
+            " padding:4px 14px; border-radius:4px; }"
+            "QPushButton:hover { background-color:#3498db; }"
+        )
+        ofl.addWidget(btn_step_mgr)
+
         root.addWidget(offset_frame)
 
-        # ── 스텝 관리 영역 ────────────────────────────────
-        step_group = QGroupBox("📋 스텝 관리 (비워두면 클래식 모드)")
-        step_group.setStyleSheet(
-            "QGroupBox { font-weight:bold; font-size:10pt; }"
-        )
-        sg_layout = QVBoxLayout(step_group)
-        sg_layout.setSpacing(4)
-
-        # 스크롤 영역
-        self._step_scroll = QScrollArea()
-        self._step_scroll.setWidgetResizable(True)
-        self._step_scroll.setFixedHeight(200)
-        self._step_scroll.setStyleSheet(
-            "QScrollArea { border:1px solid #3c3c3c; background:#1a1a1a; }"
-        )
-        self._step_container = QWidget()
-        self._step_layout    = QVBoxLayout(self._step_container)
-        self._step_layout.setSpacing(4)
-        self._step_layout.addStretch()
-        self._step_scroll.setWidget(self._step_container)
-        sg_layout.addWidget(self._step_scroll)
-
-        # 하단 컨트롤
-        step_ctrl = QHBoxLayout()
-        self.btn_add_step = QPushButton("+ 스텝 추가")
-        self.btn_add_step.setStyleSheet(
-            "QPushButton { background:#27ae60; color:white; font-weight:bold;"
-            " padding:4px 14px; border-radius:4px; }"
-            "QPushButton:hover { background:#2ecc71; }"
-        )
-        self.btn_add_step.clicked.connect(self.add_step)
-        step_ctrl.addWidget(self.btn_add_step)
-
+        # 진행 상황 라벨 (메인 창에 유지)
+        progress_row = QHBoxLayout()
         self.lbl_progress = QLabel("스텝 없음 — 클래식 모드로 실행됩니다.")
         self.lbl_progress.setStyleSheet("color:#888; font-size:9pt;")
-        step_ctrl.addWidget(self.lbl_progress)
-        step_ctrl.addStretch()
-        sg_layout.addLayout(step_ctrl)
-        root.addWidget(step_group)
+        progress_row.addWidget(self.lbl_progress)
+        progress_row.addStretch()
+        root.addLayout(progress_row)
 
         # ── 로그 콘솔 ─────────────────────────────────────
         self.log_console = QPlainTextEdit()
@@ -1483,9 +1539,18 @@ class MainWindow(QMainWindow):
         self.worker.auto_paused_signal.connect(self._on_auto_paused)
         self.setup_logging()
 
-        # 기본 스텝 삽입 — lbl_progress 등 모든 위젯 생성 후 여기서 실행
+        # 스텝 관리 다이얼로그 — lbl_progress 등 모든 위젯 생성 후 여기서 초기화
+        self._step_dlg = StepManagerDialog(self)
+        btn_step_mgr.clicked.connect(
+            lambda: (self._step_dlg.show(),
+                     self._step_dlg.raise_(),
+                     self._step_dlg.activateWindow())
+        )
+
+        # 기본 스텝 삽입
         for default_text in DEFAULT_STEPS:
-            self.add_step(text=default_text)
+            self._step_dlg.add_step(text=default_text)
+        self._update_progress_label()
 
         screen_geom = QApplication.primaryScreen().availableGeometry()
         self.move(screen_geom.right() - self.width() - 10,
@@ -1494,31 +1559,11 @@ class MainWindow(QMainWindow):
 
     # ── 스텝 관리 ─────────────────────────────────────────
     def add_step(self, _checked=False, text: str = ""):
-        # clicked 시그널은 checked(bool)를 첫 인자로 보내므로 _checked로 흡수한다.
-        idx    = len(self._step_items) + 1
-        item   = StepItemWidget(idx, text, self._step_container)
-        item.delete_requested.connect(self._remove_step)
-        # stretch 앞에 삽입
-        count = self._step_layout.count()
-        self._step_layout.insertWidget(count - 1, item)
-        self._step_items.append(item)
-        self._update_step_labels()
+        self._step_dlg.add_step(text=text)
         self._update_progress_label()
 
-    def _remove_step(self, item: StepItemWidget):
-        if item in self._step_items:
-            self._step_items.remove(item)
-            self._step_layout.removeWidget(item)
-            item.deleteLater()
-            self._update_step_labels()
-            self._update_progress_label()
-
-    def _update_step_labels(self):
-        for i, item in enumerate(self._step_items, start=1):
-            item.set_index(i)
-
     def _update_progress_label(self, current: int = 0):
-        total = len(self._step_items)
+        total = len(self._step_dlg._step_items)
         if total == 0:
             self.lbl_progress.setText("스텝 없음 — 클래식 모드로 실행됩니다.")
         elif current == 0:
@@ -1527,20 +1572,15 @@ class MainWindow(QMainWindow):
             self.lbl_progress.setText(f"▶ Step {current}/{total} 진행 중")
 
     def get_steps(self) -> list[str]:
-        return [item.get_text().strip()
-                for item in self._step_items
-                if item.get_text().strip()]
+        return self._step_dlg.get_steps()
 
     def _lock_ui(self, locked: bool):
-        self.btn_add_step.setEnabled(not locked)
-        for item in self._step_items:
-            item.set_locked(locked)
+        self._step_dlg.set_locked(locked)
 
     # ── 신호 핸들러 ───────────────────────────────────────
     def _on_step_progress(self, current: int, total: int):
         self._update_progress_label(current)
-        for i, item in enumerate(self._step_items, start=1):
-            item.set_active(i == current, done=(i < current))
+        self._step_dlg.set_step_active(current, total)
 
     def _on_auto_paused(self, reason: str):
         logging.warning(f"⚠️ 자동 일시 정지: {reason}")
@@ -1712,8 +1752,7 @@ class MainWindow(QMainWindow):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_force_next.setEnabled(False)
-        for item in self._step_items:
-            item.set_active(False)
+        self._step_dlg.set_step_active(0, 0)
         self._update_progress_label()
         logging.info("감시가 중지되었습니다.")
 
@@ -1851,7 +1890,7 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 # ---------------------------------------------------------
-# 14. 진입점
+# 15. 진입점
 # ---------------------------------------------------------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
