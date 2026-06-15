@@ -990,6 +990,14 @@ class ClaudeWorker(QThread):
         스텝 목록이 있으면 continuous_mode와 무관하게 항상 스텝 모드로 동작한다.
         자동 전진(RESUMING)은 continuous_mode가 True일 때만 수행한다."""
         if self.steps:
+            # expected_step이 총 스텝 수를 초과한 경우 즉시 완료 처리
+            if self.expected_step > len(self.steps):
+                logging.info("🎉 모든 스텝이 완료되었습니다! (초과 감지)")
+                self.continuous_mode = False
+                self.continuous_mode_changed.emit(False)
+                self._notify_all_done(claude_win)
+                self.state = State.MONITORING
+                return
             step_done = self._check_step_complete(claude_win, frame)
             if step_done:
                 logging.info(f"✅ Step {self.expected_step}/{len(self.steps)} 완료 확인!")
