@@ -12,6 +12,7 @@ import logging
 import logging.handlers
 import glob
 import json
+import html
 import tempfile
 import threading
 import urllib.request
@@ -63,6 +64,7 @@ CHECK_INTERVAL = 5
 FALLBACK_WAIT_MINUTES = 30
 PAST_TIME_GRACE_MINUTES = 5
 MAX_INPUT_LEN = 4000
+MAX_WAIT_REARM = 5            # 한도 대기 만료 후 배너 미해제 시 최대 재무장 횟수
 MAX_CONTINUE_DEFAULT = 3       # 최대 "계속" 횟수 기본값
 
 STABLE_TOKEN = "LOOPSTABLE"   # 클래식 모드 종료 토큰
@@ -263,9 +265,16 @@ def load_window_geometry() -> dict | None:
     except Exception as e:
         logging.debug(f"창 위치 읽기 실패: {e}")
         return None
-    if all(k in data for k in ("x", "y", "w", "h")):
-        return data
-    return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        geom = {k: int(data[k]) for k in ("x", "y", "w", "h")}
+    except (KeyError, TypeError, ValueError):
+        logging.debug("창 위치 값이 올바르지 않아 무시합니다.")
+        return None
+    if geom["w"] <= 0 or geom["h"] <= 0:
+        return None
+    return geom
 
 # ---------------------------------------------------------
 # 3. 텔레그램 헬퍼
@@ -627,13 +636,15 @@ class TelegramPollerThread(QThread):
                     # chat_id 필터(보안) + 만료 필터(오래된 명령 폭주 방지)
                     if text.startswith("/") and chat_id == self.chat_id:
                         date = msg.get("date")
-                        # date 누락 시(비정상 페이로드)엔 만료 검사를 건너뛰고 처리한다.
-                        age  = (time.time() - date) if date else 0
-                        if age <= TELEGRAM_CMD_TTL:
+                        # date 누락(비정상/조작 페이로드)은 만료 검증 불가 → 안전하게 폐기
+                        if not isinstance(date, (int, float)):
+                            logging.info(f"⏰ date 없는 텔레그램 명령 폐기: {text.split()[0]}")
+                        elif (time.time() - date) <= TELEGRAM_CMD_TTL:
                             # 전체 메시지를 전달 — /send 등 인자 있는 명령을 위해
                             self.command_received.emit(text)
                         else:
-                            logging.info(f"⏰ 만료된 텔레그램 명령 무시 ({int(age)}초 경과): {text.split()[0]}")
+                            age = int(time.time() - date)
+                            logging.info(f"⏰ 만료된 텔레그램 명령 무시 ({age}초 경과): {text.split()[0]}")
                     if uid > self._last_update_id:
                         self._last_update_id = uid
             except Exception as e:
@@ -848,6 +859,14 @@ class ClaudeWorker(QThread):
         self._pause_reason  : str = ""
         self._step_lock     = threading.Lock()
 
+        # GUI/텔레그램 스레드 → 워커 스레드 제어 요청 (state는 워커 스레드만 변경)
+        self._ctrl_lock          = threading.Lock()
+        self._resume_requested   = False
+        self._next_requested     = False
+
+        # 한도 대기 만료 후 배너가 안 사라질 때 재무장 횟수 (무한 대기 방지)
+        self._wait_rearm_count   = 0
+
         # 원격 /send — 텔레그램에서 받은 사용자 메시지 큐 (워커 스레드에서 전송)
         self._pending_sends : list[str] = []
         self._send_lock     = threading.Lock()
@@ -871,6 +890,7 @@ class ClaudeWorker(QThread):
         logging.info("=========================================")
         while self.running:
             try:
+                self._drain_ctrl()            # GUI/텔레그램 제어 요청 처리
                 self._flush_pending_sends()   # 원격 /send 우선 처리
                 self._update_state()
             except pyautogui.FailSafeException:
@@ -897,16 +917,28 @@ class ClaudeWorker(QThread):
                 return
             pending = self._pending_sends
             self._pending_sends = []
-        for text in pending:
+        for i, text in enumerate(pending):
             if not self.running:
+                # 종료 — 아직 못 보낸 메시지를 큐 앞쪽에 되돌려 둔다.
+                self._requeue_front(pending[i:])
                 return
-            self._send_text_to_claude(text)
+            if not self._send_text_to_claude(text):
+                # 전송 실패 — 실패분과 남은 메시지를 되돌리고 다음 주기에 재시도
+                logging.warning("/send 전송 실패 — 다음 주기에 재시도합니다.")
+                self._requeue_front(pending[i:])
+                return
 
-    def _send_text_to_claude(self, text: str):
+    def _requeue_front(self, items: list[str]):
+        if not items:
+            return
+        with self._send_lock:
+            self._pending_sends[0:0] = items
+
+    def _send_text_to_claude(self, text: str) -> bool:
         win = self._focus_claude_window()
         if not win:
-            logging.error("클로드 창을 찾을 수 없어 /send 전송을 취소합니다.")
-            return
+            logging.error("클로드 창을 찾을 수 없어 /send 전송을 보류합니다.")
+            return False
         original_clipboard = safe_clipboard_paste()
         try:
             center_x = win.left + (win.width // 2)
@@ -922,30 +954,57 @@ class ClaudeWorker(QThread):
             pyautogui.press('enter')
             time.sleep(1)
             logging.info(f"📨 /send 사용자 메시지를 전송했습니다: {text[:60]}")
+            return True
         except Exception as e:
             logging.error(f"/send 전송 실패: {e}")
+            return False
         finally:
             try:
                 pyperclip.copy(original_clipboard if original_clipboard else "")
             except Exception as e:
                 logging.debug(f"클립보드 복구 실패: {e}")
 
-    def force_next_step(self):
-        """수동으로 다음 스텝으로 강제 이동 (GUI 슬롯에서 호출)."""
+    # ── GUI/텔레그램 → 워커 제어 요청 (state 변경은 워커 스레드에서만) ──
+    def request_force_next(self):
+        """다음 스텝 강제 이동을 요청한다 (실제 처리는 워커 스레드 _drain_ctrl)."""
+        with self._ctrl_lock:
+            self._next_requested = True
+
+    def request_resume(self):
+        """연속 모드 재개를 요청한다 (PAUSED 탈출 포함)."""
+        self.continuous_mode = True
+        with self._ctrl_lock:
+            self._resume_requested = True
+
+    def _drain_ctrl(self):
+        """워커 스레드 루프 시작부에서 GUI/텔레그램이 넣은 제어 요청을 처리한다."""
+        with self._ctrl_lock:
+            do_next   = self._next_requested
+            do_resume = self._resume_requested
+            self._next_requested   = False
+            self._resume_requested = False
+        if do_next:
+            self._apply_force_next()
+        if do_resume and self.state == State.PAUSED:
+            self.state = State.RESUMING
+
+    def _apply_force_next(self):
+        """워커 스레드에서 실행 — 다음 스텝으로 강제 이동."""
         if not self.steps:
             return
         with self._step_lock:
             self.continue_count = 0
             self.expected_step  = min(self.expected_step + 1, len(self.steps) + 1)
-        logging.info(f"⏭ 강제 다음 스텝 → Step {self.expected_step}/{len(self.steps)}")
+            n = self.expected_step
+        logging.info(f"⏭ 강제 다음 스텝 → Step {n}/{len(self.steps)}")
         if self.state == State.PAUSED:
-            if self.expected_step > len(self.steps):
+            if n > len(self.steps):
                 self.continuous_mode = False
                 self.continuous_mode_changed.emit(False)
                 self.state = State.MONITORING
             else:
                 self.state = State.RESUMING
-        self.step_progress_signal.emit(self.expected_step, len(self.steps))
+        self.step_progress_signal.emit(n, len(self.steps))
 
     # ── 상태 갱신 ──────────────────────────────────────────
     def _update_state(self):
@@ -1031,9 +1090,21 @@ class ClaudeWorker(QThread):
                 if still_limited is None:
                     logging.info("한도 화면이 사라졌습니다. 즉시 재개합니다.")
                     self.target_time = None
+                    self._wait_rearm_count = 0
                     self.state = State.RESUMING
+                elif self._wait_rearm_count >= MAX_WAIT_REARM:
+                    self._pause_reason = (
+                        f"한도 화면이 {self._wait_rearm_count}회 재확인에도 사라지지 않음"
+                    )
+                    logging.warning(f"⚠️ 자동 일시 정지 — {self._pause_reason}")
+                    self.target_time = None
+                    self._wait_rearm_count = 0
+                    self.state = State.PAUSED
+                    self.auto_paused_signal.emit(self._pause_reason)
                 else:
-                    logging.info("한도 화면이 여전히 표시 중입니다. 대기를 계속합니다.")
+                    self._wait_rearm_count += 1
+                    logging.info(f"한도 화면이 여전히 표시 중입니다. 대기를 계속합니다."
+                                 f" (재무장 {self._wait_rearm_count}/{MAX_WAIT_REARM})")
                     self._setup_wait_timer(claude_win, still_limited)
 
         elif self.state == State.RESUMING:
@@ -1227,6 +1298,7 @@ class ClaudeWorker(QThread):
         pos, img_name = self._locate_rate_limit(claude_win, frame)
         if pos:
             logging.info(f"사용량 한도 도달! ({img_name}) OCR로 시간을 판독합니다.")
+            self._wait_rearm_count = 0   # 새 한도 감지 — 재무장 카운터 초기화
             self._setup_wait_timer(claude_win, pos)
             return True
         return False
@@ -1755,7 +1827,7 @@ class MainWindow(QMainWindow):
         self.btn_force_next.setEnabled(True)
 
     def _on_force_next(self):
-        self.worker.force_next_step()
+        self.worker.request_force_next()
         self.btn_force_next.setEnabled(False)
 
     def _sync_continuous_checkbox(self, on: bool):
@@ -1799,14 +1871,12 @@ class MainWindow(QMainWindow):
             self._sync_continuous_checkbox(False)
             reply("[Auto-Pilot] 연속 모드를 OFF했습니다.")
         elif cmd == "/resume":
-            self.worker.continuous_mode = True
+            self.worker.request_resume()   # continuous_mode ON + 워커 스레드에서 PAUSED 탈출
             self._sync_continuous_checkbox(True)
-            if self.worker.state == State.PAUSED:
-                self.worker.state = State.RESUMING
             reply("[Auto-Pilot] 연속 모드를 ON했습니다.")
         elif cmd == "/next":
             next_n = min(self.worker.expected_step + 1, len(self.worker.steps) + 1) if self.worker.steps else 1
-            QTimer.singleShot(0, self._on_force_next)
+            self.worker.request_force_next()
             reply(f"[Auto-Pilot] 강제 다음 스텝 → Step {next_n}")
         elif cmd == "/screen":
             # _on_telegram_command은 메인 스레드 단독 실행 → 플래그 검사·설정에 경쟁 없음.
@@ -2131,17 +2201,18 @@ class MainWindow(QMainWindow):
         logger.addHandler(fh)
 
     def append_log(self, msg: str, record: logging.LogRecord):
+        safe = html.escape(msg)
         if record.levelno >= logging.ERROR:
-            html = f"<span style='color:#ff5555;'>{msg}</span>"
+            body = f"<span style='color:#ff5555;'>{safe}</span>"
         elif record.levelno == logging.WARNING:
-            html = f"<span style='color:#ffb86c;'>{msg}</span>"
+            body = f"<span style='color:#ffb86c;'>{safe}</span>"
         elif any(k in msg for k in ("감지되었습니다", "완료되었습니다", "이동 중")):
-            html = f"<span style='color:#50fa7b;'>{msg}</span>"
+            body = f"<span style='color:#50fa7b;'>{safe}</span>"
         elif "[상태 변경]" in msg:
-            html = f"<span style='color:#8be9fd;'>{msg}</span>"
+            body = f"<span style='color:#8be9fd;'>{safe}</span>"
         else:
-            html = f"<span style='color:#d4d4d4;'>{msg}</span>"
-        self.log_console.appendHtml(html)
+            body = f"<span style='color:#d4d4d4;'>{safe}</span>"
+        self.log_console.appendHtml(body)
         self.log_console.verticalScrollBar().setValue(
             self.log_console.verticalScrollBar().maximum())
 
@@ -2170,7 +2241,18 @@ class MainWindow(QMainWindow):
                 logging.warning("워커가 제때 종료되지 않아 강제 종료합니다.")
                 self.worker.terminate()
                 self.worker.wait()
+                # terminate가 pyautogui 키 입력 도중 끊었을 수 있으므로
+                # 눌린 채 남았을 수 있는 수정자 키를 해제한다.
+                self._release_stuck_modifiers()
         super().closeEvent(event)
+
+    @staticmethod
+    def _release_stuck_modifiers():
+        try:
+            for key in ("ctrl", "shift", "alt", "win"):
+                pyautogui.keyUp(key)
+        except Exception as e:
+            logging.debug(f"수정자 키 해제 실패: {e}")
 
 # ---------------------------------------------------------
 # 15. 진입점
