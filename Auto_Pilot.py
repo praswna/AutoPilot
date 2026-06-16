@@ -880,6 +880,14 @@ class ClaudeWorker(QThread):
         self.running = True
         self.state   = State.IDLE
         self.last_status_msg = ""
+        # 이전 실행에서 남았을 수 있는 묵은 제어 요청·큐·타이머를 초기화한다.
+        # (폴러는 감시 중지 후에도 살아있어 stop~start 사이 명령이 쌓일 수 있음)
+        with self._ctrl_lock:
+            self._next_requested = self._resume_requested = False
+        with self._send_lock:
+            self._pending_sends = []
+        self._wait_rearm_count = 0
+        self.target_time = None
         logging.info("=========================================")
         logging.info(f"{APP_NAME} v{VERSION} 감시 스레드를 시작합니다.")
         self._check_resources()
@@ -989,22 +997,27 @@ class ClaudeWorker(QThread):
             self.state = State.RESUMING
 
     def _apply_force_next(self):
-        """워커 스레드에서 실행 — 다음 스텝으로 강제 이동."""
+        """워커 스레드에서 실행 — 현재 스텝을 건너뛰고 다음 스텝을 즉시 지시한다.
+        클래식 모드(스텝 없음)에서는 PAUSED 탈출만 처리한다."""
         if not self.steps:
+            if self.state == State.PAUSED:
+                self.state = State.RESUMING
             return
         with self._step_lock:
             self.continue_count = 0
             self.expected_step  = min(self.expected_step + 1, len(self.steps) + 1)
             n = self.expected_step
         logging.info(f"⏭ 강제 다음 스텝 → Step {n}/{len(self.steps)}")
-        if self.state == State.PAUSED:
-            if n > len(self.steps):
-                self.continuous_mode = False
-                self.continuous_mode_changed.emit(False)
-                self.state = State.MONITORING
-            else:
-                self.state = State.RESUMING
-        self.step_progress_signal.emit(n, len(self.steps))
+        if n > len(self.steps):
+            # 마지막 스텝까지 건너뜀 → 완료로 간주하고 감시만 유지
+            self.continuous_mode = False
+            self.continuous_mode_changed.emit(False)
+            self.state = State.MONITORING
+            self.step_progress_signal.emit(len(self.steps), len(self.steps))
+        else:
+            # GENERATING/RESUMING/WAITING/PAUSED 어디서든 다음 스텝 프롬프트를 보내도록 재동기화
+            self.state = State.RESUMING
+            self.step_progress_signal.emit(n, len(self.steps))
 
     # ── 상태 갱신 ──────────────────────────────────────────
     def _update_state(self):
