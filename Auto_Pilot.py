@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
     QFormLayout, QLineEdit, QDialogButtonBox, QGroupBox,
     QMessageBox, QScrollArea, QFrame, QSizePolicy,
 )
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer, QObject
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer, QObject, QRect
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QBrush
 
 import pyautogui
@@ -776,7 +776,8 @@ class StepManagerDialog(QDialog):
 
     def closeEvent(self, event):
         # 창을 닫을 때(숨길 때) 현재 스텝을 저장해 다음 실행에 복원한다.
-        save_steps([item.get_text() for item in self._step_items])
+        # 빈 줄은 제외(런타임 get_steps와 동일 의미)해 저장본과 실행 목록을 일치시킨다.
+        save_steps(self.get_steps())
         self.hide()
         event.ignore()
 
@@ -1712,7 +1713,7 @@ class MainWindow(QMainWindow):
 
         # 저장된 창 위치·크기 복원 — 없으면 우측 하단에 배치
         geom = load_window_geometry()
-        if geom:
+        if geom and self._geometry_on_screen(geom):
             self.resize(geom["w"], geom["h"])
             self.move(geom["x"], geom["y"])
         else:
@@ -1758,9 +1759,10 @@ class MainWindow(QMainWindow):
         self.btn_force_next.setEnabled(False)
 
     def _sync_continuous_checkbox(self, on: bool):
-        self.cb_continuous.blockSignals(True)
-        self.cb_continuous.setChecked(on)
-        self.cb_continuous.blockSignals(False)
+        for cb in (self.cb_continuous, self.cb_continuous_mini):
+            cb.blockSignals(True)
+            cb.setChecked(on)
+            cb.blockSignals(False)
 
     # ── 텔레그램 명령 처리 ────────────────────────────────
     def _on_telegram_command(self, raw: str):
@@ -1894,8 +1896,9 @@ class MainWindow(QMainWindow):
         self.worker.steps           = steps
         self.worker.expected_step   = 1
         self.worker.continue_count  = 0
-        self.worker.continuous_mode = self.cb_continuous.isChecked()
         self.worker.loop_forever    = self.cb_loop_forever.isChecked()
+        # 무한 반복은 연속 모드를 전제로 한다 (연속 OFF면 스텝 자동 진행이 일어나지 않음)
+        self.worker.continuous_mode = self.cb_continuous.isChecked() or self.worker.loop_forever
 
         # F12 전역 긴급 정지 등록
         if HAS_KEYBOARD:
@@ -2012,9 +2015,14 @@ class MainWindow(QMainWindow):
             logging.info("⚙️ 환경 설정이 저장되었습니다.")
 
     def open_telegram_settings(self):
+        def _poll_cfg():
+            c = load_telegram_config() or {}
+            return (c.get("bot_token"), c.get("chat_id"), c.get("bidirectional"))
+        before = _poll_cfg()
         TelegramSettingsDialog(self).exec()
-        # 설정 변경(토큰/양방향 토글)을 즉시 반영하도록 폴러를 재시작
-        self._restart_tg_poller()
+        # 실제로 토큰/chat_id/양방향 토글이 바뀌었을 때만 폴러를 재시작 (불필요한 명령 누락 방지)
+        if _poll_cfg() != before:
+            self._restart_tg_poller()
 
     # ── 기타 UI 슬롯 ──────────────────────────────────────
     def update_offset(self, value: int):
@@ -2040,9 +2048,25 @@ class MainWindow(QMainWindow):
         self.cb_loop_forever_mini.blockSignals(False)
         self.worker.loop_forever = on
         logging.info(f"무한 반복 모드가 {'ON' if on else 'OFF'} 되었습니다.")
+        # 무한 반복은 연속 모드를 전제로 한다 — 켜면 연속 모드도 자동 ON
+        if on and not self.cb_continuous.isChecked():
+            self.cb_continuous.setChecked(True)
+            logging.info("무한 반복을 위해 연속 작업 모드를 자동으로 켰습니다.")
 
     def _on_loop_forever_mini(self, _):
         self.cb_loop_forever.setChecked(self.cb_loop_forever_mini.isChecked())
+
+    @staticmethod
+    def _geometry_on_screen(geom: dict) -> bool:
+        """저장된 창 사각형이 현재 화면 중 하나와 충분히 겹치는지 검사한다.
+        (모니터 구성 변경으로 좌표가 화면 밖이면 False → 기본 위치로 복원)"""
+        rect = QRect(geom["x"], geom["y"], geom["w"], geom["h"])
+        for screen in QApplication.screens():
+            inter = screen.availableGeometry().intersected(rect)
+            # 제목 표시줄을 잡을 수 있을 만큼(가로 100px·세로 30px 이상) 보이면 OK
+            if inter.width() >= 100 and inter.height() >= 30:
+                return True
+        return False
 
     def toggle_collapsed(self):
         """로그만 보이도록 접거나, 모든 컨트롤을 다시 펼친다."""
@@ -2130,7 +2154,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         # 종료 시 현재 스텝과 창 위치·크기를 저장해 다음 실행에 복원한다.
-        save_steps([item.get_text() for item in self._step_dlg._step_items])
+        save_steps(self._step_dlg.get_steps())
         save_window_geometry(self.x(), self.y(), self.width(), self.height())
         self._stop_tg_poller()
         if HAS_KEYBOARD:
