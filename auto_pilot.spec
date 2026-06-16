@@ -17,7 +17,7 @@ if _os.path.exists('steps.json'):
     _png_datas.append(('steps.json', '.'))
 
 a = Analysis(
-    ['auto_pilot.py'],
+    ['Auto_Pilot.py'],
     pathex=[],
     binaries=[],
     datas=_png_datas,
