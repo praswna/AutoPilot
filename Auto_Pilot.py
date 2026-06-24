@@ -347,6 +347,14 @@ def parse_target_time(text: str) -> datetime.datetime | None:
             if m2:
                 hour, minute = int(m2.group(1)), 0
     if hour is None or minute is None:
+        # OCR이 콜론을 누락해 "오전 1:40"이 "오전 140"처럼 붙어 나오는 경우 보정.
+        # 오전/오후(AM/PM) 표식 뒤의 숫자를, 뒤 2자리를 분·나머지를 시로 해석한다.
+        # (예: "오전 140" → 1:40, "오후 1240" → 12:40)
+        m3 = re.search(r'(?:오전|오후|am|pm)\s*(\d{1,2})\s*[:\.]?\s*(\d{2})',
+                       text, re.IGNORECASE)
+        if m3:
+            hour, minute = int(m3.group(1)), int(m3.group(2))
+    if hour is None or minute is None:
         return None
     if not (0 <= hour <= 24) or not (0 <= minute <= 59):
         return None
