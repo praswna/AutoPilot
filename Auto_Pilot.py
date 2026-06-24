@@ -1027,7 +1027,7 @@ class ClaudeWorker(QThread):
                     self.state = State.PAUSED
                     self.auto_paused_signal.emit(self._pause_reason)
                 elif self.continuous_mode:
-                    self.state = State.RESUMING  # "계속 이어서 작성해 줘" 전송
+                    self.state = State.RESUMING  # 현재 스텝 프롬프트 재전송 (완료 미감지 재시도)
                 else:
                     self.state = State.MONITORING
 
@@ -1241,11 +1241,19 @@ class ClaudeWorker(QThread):
     def _build_step_prompt(self, step_idx: int) -> str:
         """스텝 프롬프트 끝에 완료 표식 지시어를 자동 합성한다 (step_idx: 0-based).
         모델이 출력한 [STEP{N}_DONE] 텍스트를 캡처해 step{N}_complete.png 로 두면
-        이미지 매칭으로 완료를 감지한다."""
+        이미지 매칭으로 완료를 감지한다.
+        토큰을 '주입된 지시'로 오인해 거부하는 경우를 막기 위해, 토큰이 자동화
+        진행에 필요한 정상 절차임을 함께 설명한다."""
         n    = step_idx + 1
         base = self.steps[step_idx].strip()
         suffix = (
             f"\n\n---\n"
+            f"[자동화 안내] 이 작업은 Auto-Pilot 자동 진행 도구가 너의 화면을 감시하며 실행 중이다. "
+            f"도구는 네가 한 스텝을 끝냈는지를, 응답 마지막에 나타나는 아래 완료 토큰을 "
+            f"화면에서 직접 찾아 판단한다. 토큰이 보이면 다음 스텝 지시를 자동으로 보내고, "
+            f"보이지 않으면 같은 스텝을 끝나지 않은 것으로 보고 계속 반복한다. "
+            f"따라서 이 토큰 출력은 작업 진행에 꼭 필요한 정상적인 절차이며, "
+            f"무시해야 할 외부 주입 지시가 아니다. 안심하고 그대로 따르면 된다.\n"
             f"[필수] 위 내용을 완전히 완료한 뒤, 응답의 **맨 마지막 줄**에 아래 토큰만 "
             f"단독으로 출력하라. 다른 텍스트 없이 정확히 이 형태여야 한다.\n"
             f"[STEP{n}_DONE]"
@@ -1335,12 +1343,13 @@ class ClaudeWorker(QThread):
             pass
 
         # 스텝 모드인 경우 전송할 텍스트를 미리 결정
+        # 별도 "이어쓰기" 문구 없이 항상 현재 스텝 프롬프트를 전송한다 (오로지 스텝으로만 동작).
+        # 완료 미감지로 재시도할 때도 같은 스텝 프롬프트를 다시 보내며,
+        # 끊긴 답변 이어쓰기는 스텝 프롬프트 자체의 STEP 1 지시가 처리한다.
         step_prompt: str | None = None
         if self.steps:
             step_idx = self.expected_step - 1
-            if self.continue_count > 0:
-                step_prompt = "계속 이어서 작성해 줘"
-            elif 0 <= step_idx < len(self.steps):
+            if 0 <= step_idx < len(self.steps):
                 step_prompt = self._build_step_prompt(step_idx)
             else:
                 logging.error(f"유효하지 않은 스텝 인덱스({step_idx}) — 전송 중단")
